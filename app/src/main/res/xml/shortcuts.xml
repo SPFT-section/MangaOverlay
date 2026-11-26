@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:shortcutId="start"
+        android:enabled="true"
+        android:icon="@drawable/ic_sc_start"
+        android:shortcutShortLabel="@string/sc_start_short"
+        android:shortcutLongLabel="@string/sc_start_long">
+        <intent
+            android:action="com.sunmind.mangaoverlay.START"
+            android:targetPackage="com.sunmind.mangaoverlay"
+            android:targetClass="com.sunmind.mangaoverlay.MainActivity"/>
+    </shortcut>
+    <shortcut
+        android:shortcutId="dict"
+        android:enabled="true"
+        android:icon="@drawable/ic_sc_dict"
+        android:shortcutShortLabel="@string/sc_dict_short"
+        android:shortcutLongLabel="@string/sc_dict_long">
+        <intent
+            android:action="com.sunmind.mangaoverlay.LOOKUP"
+            android:targetPackage="com.sunmind.mangaoverlay"
+            android:targetClass="com.sunmind.mangaoverlay.MainActivity"/>
+    </shortcut>
+</shortcuts>

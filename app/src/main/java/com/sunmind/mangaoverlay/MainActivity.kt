@@ -1,61 +1,260 @@
 package com.sunmind.mangaoverlay
 
 import android.app.Activity
-import android.content.pm.PackageManager
-import kotlinx.coroutines.runBlocking
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.pm.ShortcutInfo
+import android.content.pm.ShortcutManager
+import android.content.res.ColorStateList
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.Icon
+import android.graphics.drawable.RippleDrawable
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
+import android.text.InputType
 import android.view.Gravity
+import android.view.View
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
 import android.widget.*
+import kotlinx.coroutines.runBlocking
 
 class MainActivity : Activity() {
+    companion object {
+        const val ACTION_START = "com.sunmind.mangaoverlay.START"
+        const val ACTION_LOOKUP = "com.sunmind.mangaoverlay.LOOKUP"
+        private val BG = 0xFF0F1115.toInt()
+        private val CARD = 0xFF181B22.toInt()
+        private val LINE = 0xFF2A2F3A.toInt()
+        private val TXT = 0xFFE5E7EB.toInt()
+        private val SUB = 0xFF9CA3AF.toInt()
+        private val ACCENT = 0xFF22C55E.toInt()
+        private val ACCENT_D = 0xFF16A34A.toInt()
+        private val AMBER = 0xFFF59E0B.toInt()
+        private val RED = 0xFFDC2626.toInt()
+    }
+
     private val reqCap = 1
     private val reqNotif = 2
+    private val main = Handler(Looper.getMainLooper())
+    private lateinit var scroll: ScrollView
+    private lateinit var dictCard: View
     private lateinit var out: TextView
-    private lateinit var cbMerge: CheckBox
-    private lateinit var cbFit: CheckBox
-    private lateinit var cbBold: CheckBox
+    private lateinit var box: EditText
     private lateinit var gl: EditText
+    private lateinit var tvPerm: TextView
+    private lateinit var tvRun: TextView
+    private lateinit var startBtn: TextView
 
+    // ---------- ตัวช่วยสร้าง UI ----------
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    private fun shape(c: Int, r: Int, stroke: Int = 0) = GradientDrawable().apply {
+        setColor(c); cornerRadius = dp(r).toFloat()
+        if (stroke != 0) setStroke(dp(1), stroke)
+    }
+
+    private fun ripple(c: Int, r: Int) = RippleDrawable(ColorStateList.valueOf(0x33FFFFFF), shape(c, r), null)
+
+    private fun tv(t: String, sp: Float, color: Int, bold: Boolean = false) = TextView(this).apply {
+        text = t; textSize = sp; setTextColor(color)
+        if (bold) typeface = Typeface.DEFAULT_BOLD
+    }
+
+    private fun lp(top: Int = 0) = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(top) }
+
+    private fun card(build: LinearLayout.() -> Unit) = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(16), dp(14), dp(16), dp(16))
+        background = shape(CARD, 18, LINE)
+        build()
+    }
+
+    private fun section(t: String) = tv(t, 13f, ACCENT, true).apply { setPadding(0, 0, 0, dp(6)) }
+
+    private fun button(t: String, c: Int, onClick: () -> Unit) = TextView(this).apply {
+        text = t; textSize = 16f; setTextColor(Color.WHITE); typeface = Typeface.DEFAULT_BOLD; gravity = Gravity.CENTER
+        setPadding(dp(16), dp(14), dp(16), dp(14)); background = ripple(c, 14); isClickable = true
+        setOnClickListener { onClick() }
+    }
+
+    private fun field(e: EditText) = e.apply {
+        setTextColor(TXT); setHintTextColor(SUB); textSize = 15f
+        background = shape(0xFF10131A.toInt(), 12, LINE); setPadding(dp(12), dp(10), dp(12), dp(10))
+    }
+
+    private fun line() = View(this).apply { setBackgroundColor(LINE) }
+
+    private fun toggleRow(title: String, desc: String, on: Boolean, set: (Boolean) -> Unit): View {
+        val sw = Switch(this).apply {
+            isChecked = on
+            val st = arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf())
+            thumbTintList = ColorStateList(st, intArrayOf(Color.WHITE, 0xFFD1D5DB.toInt()))
+            trackTintList = ColorStateList(st, intArrayOf(ACCENT, 0xFF4B5563.toInt()))
+            setOnCheckedChangeListener { _, v -> set(v) }
+        }
+        val t = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(tv(title, 15f, TXT)); addView(tv(desc, 12f, SUB))
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+            addView(t, LinearLayout.LayoutParams(0, -2, 1f)); addView(sw)
+        }
+    }
+
+    private fun seekRow(title: String, min: Int, max: Int, cur: Int, fmt: (Int) -> String, set: (Int) -> Unit): View {
+        val label = tv("$title: ${fmt(cur)}", 14f, TXT)
+        val sb = SeekBar(this).apply {
+            this.max = max - min; progress = cur - min
+            progressTintList = ColorStateList.valueOf(ACCENT); thumbTintList = ColorStateList.valueOf(ACCENT)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) {
+                    label.text = "$title: ${fmt(p + min)}"
+                    if (u) set(p + min)
+                }
+                override fun onStartTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) {}
+            })
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; setPadding(0, dp(10), 0, dp(4))
+            addView(label); addView(sb)
+        }
+    }
+
+    // ---------- วงจรชีวิต ----------
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         Prefs.init(this)
-        val pad = (16 * resources.displayMetrics.density).toInt()
-        val box = EditText(this).apply { hint = "พิมพ์คำหรือประโยคภาษาอังกฤษ" }
-        out = TextView(this).apply { textSize = 16f; setPadding(0, pad, 0, 0) }
-        cbMerge = CheckBox(this).apply { text = "รวมบรรทัดในกรอบคำพูดเดียวกันก่อนแปล"; isChecked = Prefs.merge }
-        cbFit = CheckBox(this).apply { text = "ขยายกล่องคำแปลให้พอดีกรอบคำพูด"; isChecked = Prefs.fit }
-        cbBold = CheckBox(this).apply { text = "ตัวอักษรหนา"; isChecked = Prefs.bold }
-        gl = EditText(this).apply {
+        window.statusBarColor = BG; window.navigationBarColor = BG
+
+        tvPerm = tv("", 14f, TXT); tvRun = tv("", 14f, TXT)
+        startBtn = button("เริ่มแปล", ACCENT_D) { if (OverlayService.running) stopService() else start() }
+
+        gl = field(EditText(this).apply {
             hint = "ชื่อ/ศัพท์เฉพาะ บรรทัดละคำ รูปแบบ อังกฤษ=ไทย\nเช่น\nLuffy=ลูฟี่\nStraw Hat Pirates=โจรสลัดหมวกฟาง"
             minLines = 4; gravity = Gravity.TOP; setText(Prefs.glossary)
-        }
-        val lookup = Button(this).apply { text = "ค้นพจนานุกรม"; setOnClickListener { lookup(box.text.toString().trim()) } }
-        val start = Button(this).apply { text = "เริ่ม / Start"; setOnClickListener { start() } }
-        setContentView(ScrollView(this).apply {
-            addView(LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.VERTICAL; setPadding(pad, pad * 2, pad, pad)
-                addView(start); addView(cbMerge); addView(cbFit); addView(cbBold); addView(gl)
-                addView(box); addView(lookup); addView(out)
-            })
         })
+        box = field(EditText(this).apply {
+            hint = "พิมพ์คำหรือประโยคภาษาอังกฤษ"
+            inputType = InputType.TYPE_CLASS_TEXT; imeOptions = EditorInfo.IME_ACTION_SEARCH; setSingleLine()
+            setOnEditorActionListener { _, id, _ ->
+                if (id == EditorInfo.IME_ACTION_SEARCH) { lookup(text.toString().trim()); true } else false
+            }
+        })
+        out = tv("", 16f, TXT).apply { setPadding(0, dp(12), 0, 0); setTextIsSelectable(true) }
+
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(tv("Manga Overlay", 28f, TXT, true))
+            addView(tv("แปลมังงะ อังกฤษ → ไทย แบบลอยทับหน้าจอ", 13f, SUB))
+        }
+
+        val status = card {
+            addView(section("สถานะ"))
+            addView(tvPerm); addView(tvRun, lp(4))
+            addView(startBtn, lp(14))
+        }
+
+        val display = card {
+            addView(section("การแสดงผล"))
+            addView(toggleRow("รวมบรรทัดในกรอบคำพูด", "รวมข้อความในกรอบเดียวกันก่อนแปล ได้ประโยคที่สมบูรณ์ขึ้น", Prefs.merge) { Prefs.merge = it })
+            addView(line(), LinearLayout.LayoutParams(-1, 1))
+            addView(toggleRow("ขยายกล่องให้พอดีกรอบ", "กล่องคำแปลคลุมกรอบคำพูดทั้งกรอบ", Prefs.fit) { Prefs.fit = it })
+            addView(line(), LinearLayout.LayoutParams(-1, 1))
+            addView(toggleRow("ตัวอักษรหนา", "อ่านง่ายขึ้นบนกรอบสีอ่อน", Prefs.bold) { Prefs.bold = it })
+            addView(line(), LinearLayout.LayoutParams(-1, 1))
+            addView(toggleRow("สั่นเมื่อแตะปุ่มลอย", "ให้ฟีดแบ็กตอนแตะ แตะสองครั้ง และกดค้าง", Prefs.haptic) { Prefs.haptic = it })
+            addView(seekRow("ความทึบของกล่องคำแปล", 40, 100, Prefs.opacity, { "$it%" }) { Prefs.opacity = it })
+            addView(seekRow("ขนาดตัวอักษรสูงสุด", 16, 40, Prefs.maxSp, { "$it sp" }) { Prefs.maxSp = it })
+        }
+
+        val glossary = card {
+            addView(section("ศัพท์เฉพาะ / ชื่อตัวละคร"))
+            addView(gl)
+        }
+
+        dictCard = card {
+            addView(section("พจนานุกรม / แปลด่วน"))
+            addView(box)
+            addView(button("แปล", ACCENT_D) { lookup(box.text.toString().trim()) }, lp(10))
+            addView(out)
+        }
+
+        val tips = card {
+            addView(section("ทางลัด"))
+            addView(tv(
+                "• แตะปุ่มลอย = เปิด/ปิดการแปล\n" +
+                "• แตะสองครั้ง = สแกนหน้านี้ใหม่ทันที\n" +
+                "• กดค้าง = เมนูด่วน (สแกนใหม่ / ดูต้นฉบับ / ตั้งค่า / ปิด)\n" +
+                "• ลากปุ่ม = ย้ายตำแหน่ง (ดูดติดขอบจออัตโนมัติ)\n" +
+                "• แถบแจ้งเตือน = ปุ่มเปิด-ปิดแปล / สแกนใหม่ / หยุด\n" +
+                "• กดไอคอนแอปค้าง = ทางลัด \"เริ่มแปล\" และ \"พจนานุกรม\"\n" +
+                "• เพิ่มไทล์ \"Manga Overlay\" ใน Quick Settings เพื่อเริ่ม/หยุดจากแถบด้านบน",
+                13f, SUB).apply { setLineSpacing(0f, 1.2f) })
+            addView(button("ปักทางลัด \"เริ่มแปล\" บนหน้าจอหลัก", 0xFF374151.toInt()) { pin() }, lp(12))
+        }
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(20), dp(16), dp(28))
+            addView(header)
+            addView(status, lp(20)); addView(display, lp(12)); addView(glossary, lp(12))
+            addView(dictCard, lp(12)); addView(tips, lp(12))
+        }
+        scroll = ScrollView(this).apply { setBackgroundColor(BG); isFillViewport = true; addView(root) }
+        setContentView(scroll)
+        if (b == null) handle(intent)
     }
 
-    private fun save() {
-        Prefs.merge = cbMerge.isChecked; Prefs.fit = cbFit.isChecked; Prefs.bold = cbBold.isChecked
-        Prefs.glossary = gl.text.toString()
+    override fun onNewIntent(i: Intent) { super.onNewIntent(i); setIntent(i); handle(i) }
+
+    /** ทางลัดจากไอคอนแอป / ไทล์ / ปักหน้าจอหลัก */
+    private fun handle(i: Intent?) {
+        when (i?.action) {
+            ACTION_START -> { setIntent(Intent(this, MainActivity::class.java)); main.post { start() } }
+            ACTION_LOOKUP -> {
+                setIntent(Intent(this, MainActivity::class.java))
+                scroll.post {
+                    scroll.scrollTo(0, dictCard.top); box.requestFocus()
+                    getSystemService(InputMethodManager::class.java)?.showSoftInput(box, 0)
+                }
+            }
+        }
     }
+
+    override fun onResume() { super.onResume(); refresh() }
+
+    private fun refresh() {
+        val ok = Settings.canDrawOverlays(this)
+        tvPerm.text = if (ok) "● สิทธิ์แสดงทับแอปอื่น: พร้อม" else "● สิทธิ์แสดงทับแอปอื่น: ยังไม่อนุญาต (กดเริ่มเพื่อตั้งค่า)"
+        tvPerm.setTextColor(if (ok) ACCENT else AMBER)
+        val run = OverlayService.running
+        tvRun.text = if (run) "● กำลังทำงาน" else "● หยุดอยู่"
+        tvRun.setTextColor(if (run) ACCENT else SUB)
+        startBtn.text = if (run) "หยุดการทำงาน" else "เริ่มแปล"
+        startBtn.background = ripple(if (run) RED else ACCENT_D, 14)
+    }
+
+    private fun save() { Prefs.glossary = gl.text.toString() }
 
     override fun onPause() { save(); super.onPause() }
 
+    // ---------- พจนานุกรม ----------
     private fun lookup(q: String) {
         if (q.isEmpty()) return
         out.text = "กำลังค้นหา..."
         val app = applicationContext
+        save()
         Thread {
             val r = try {
                 Dict.load(app)
@@ -71,8 +270,27 @@ class MainActivity : Activity() {
         }.start()
     }
 
+    // ---------- เริ่ม/หยุด ----------
+    private fun pin() {
+        val sm = getSystemService(ShortcutManager::class.java)
+        if (sm == null || !sm.isRequestPinShortcutSupported) {
+            Toast.makeText(this, "ตัวเปิดแอปนี้ไม่รองรับการปักทางลัด ลองกดไอคอนแอปค้างแทน", Toast.LENGTH_LONG).show(); return
+        }
+        val si = ShortcutInfo.Builder(this, "start_pin")
+            .setShortLabel("เริ่มแปล").setLongLabel("เริ่ม Manga Overlay")
+            .setIcon(Icon.createWithResource(this, R.mipmap.ic_launcher))
+            .setIntent(Intent(this, MainActivity::class.java).setAction(ACTION_START)).build()
+        sm.requestPinShortcut(si, null)
+    }
+
+    private fun stopService() {
+        startService(Intent(this, OverlayService::class.java).setAction(OverlayService.ACTION_STOP))
+        main.postDelayed({ if (!isDestroyed) refresh() }, 400)
+    }
+
     private fun start() {
         save()
+        if (OverlayService.running) { Toast.makeText(this, "Manga Overlay ทำงานอยู่แล้ว", Toast.LENGTH_SHORT).show(); refresh(); return }
         if (!Settings.canDrawOverlays(this)) {
             Toast.makeText(this, "กรุณาอนุญาต \"แสดงทับแอปอื่น\" แล้วกดเริ่มอีกครั้ง", Toast.LENGTH_LONG).show()
             startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))); return

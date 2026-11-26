@@ -14,6 +14,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import android.content.Context
+import java.io.File
 import com.google.android.gms.tasks.Task
 import com.google.mlkit.common.model.DownloadConditions
 import com.google.mlkit.nl.translate.TranslateLanguage
@@ -382,11 +383,44 @@ object Translator {
     @Volatile private var googleFails = 0
     @Volatile private var googleDownUntil = 0L
 
-    fun init(ctx: Context) { app = ctx.applicationContext; cache.evictAll() }
+    @Volatile private var glKey: String? = null
+    @Volatile private var lastSave = 0L
+
+    /** แคชคำแปลถูกเก็บลงดิสก์ด้วย (เปิดแอปใหม่/อ่านหน้าเดิมซ้ำ = ได้คำแปลทันทีไม่ต้องรอเน็ต) ล้างเมื่อศัพท์เฉพาะเปลี่ยน */
+    fun init(ctx: Context) {
+        app = ctx.applicationContext
+        val g = Prefs.glossary
+        if (g != glKey) { cache.evictAll(); glKey = g; loadDisk(g) }
+    }
+
+    private fun loadDisk(g: String) {
+        try {
+            val f = File(app.filesDir, "tr_cache.tsv")
+            if (!f.exists()) return
+            val lines = f.readLines()
+            if (lines.firstOrNull() != "#" + g.hashCode()) return
+            for (k in 1 until lines.size) {
+                val l = lines[k]; val i = l.indexOf('\t')
+                if (i > 0) cache.put(l.substring(0, i), l.substring(i + 1))
+            }
+        } catch (e: Exception) { }
+    }
+
+    @Synchronized private fun saveDisk() {
+        try {
+            val k0 = glKey ?: return
+            val e = cache.snapshot().entries.toList().takeLast(2000)
+            val sb = StringBuilder("#").append(k0.hashCode()).append('\n')
+            for ((k, v) in e) if ('\t' !in k && '\n' !in k && '\t' !in v && '\n' !in v) sb.append(k).append('\t').append(v).append('\n')
+            val tmp = File(app.filesDir, "tr_cache.tmp"); tmp.writeText(sb.toString())
+            tmp.renameTo(File(app.filesDir, "tr_cache.tsv"))
+        } catch (e: Exception) { }
+    }
 
     /** ปล่อยโมเดล/ตัวแปลเมื่อปิดบริการ (init ครั้งถัดไปจะสร้างใหม่เอง) */
     @Synchronized fun close() {
         onStatus = null
+        saveDisk()
         client?.close(); client = null; offlineReady = false
     }
     private fun status(m: String) { onStatus?.invoke(m) }
@@ -432,6 +466,7 @@ object Translator {
         if (d.values.any { it.isNotBlank() }) setEngine("พจนานุกรม")
         for ((k, v) in g) cache.put(k, v)
         for ((k, v) in o) cache.put(k, v)
+        if ((g.isNotEmpty() || o.isNotEmpty()) && now - lastSave > 20000) { lastSave = now; saveDisk() }
         return g + o + d
     }
 

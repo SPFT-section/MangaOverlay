@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="sc_start_short">เริ่มแปล</string>
+    <string name="sc_start_long">เริ่ม Manga Overlay</string>
+    <string name="sc_dict_short">พจนานุกรม</string>
+    <string name="sc_dict_long">ค้นพจนานุกรม / แปลด่วน</string>
+</resources>
