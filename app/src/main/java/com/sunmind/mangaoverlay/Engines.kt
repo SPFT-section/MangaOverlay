@@ -5,6 +5,7 @@ import android.graphics.Color
 import android.graphics.Rect
 import android.util.LruCache
 import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.*
@@ -18,28 +19,168 @@ import com.google.mlkit.common.model.DownloadConditions
 import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.TranslatorOptions
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
-class Item(val r: Rect, val text: String, val bg: Int)
+class Item(val r: Rect, val text: String, val bg: Int, val bubble: Boolean = false)
 
 object Ocr {
     private val rec = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+    private const val ST = 2      // ลดความละเอียดตอนหากรอบคำพูด
+    private const val TOL = 28    // ความต่างความสว่างที่ยังนับเป็นพื้นกรอบเดียวกัน
+    private val junkRe = Regex("(?i)(https?:|www\\.|\\w\\.(com|net|org)\\b|@\\w)")
+    private val noLetterRe = Regex("^[\\d\\s\\p{Punct}]+$")
 
-    suspend fun run(bmp: Bitmap, minTop: Int = 0): List<Item> = suspendCancellableCoroutine { c ->
-        rec.process(InputImage.fromBitmap(bmp, 0))
-            .addOnSuccessListener { t ->
-                c.resume(t.textBlocks.mapNotNull { b ->
-                    val bb = b.boundingBox ?: return@mapNotNull null
-                    if (bb.top < minTop) return@mapNotNull null
-                    if (b.lines.isNotEmpty() && b.lines.map { it.confidence }.average() < 0.35) return@mapNotNull null
-                    val raw = b.text.replace("-\n", "").replace("\n", " ").replace(Regex("\\s+"), " ").trim()
-                    val letters = raw.count { it.isLetter() }
-                    if (letters < 2 && raw != "I" && raw != "A") return@mapNotNull null
-                    Item(Rect(bb), normalize(raw), bgOf(bmp, bb))
-                })
+    private class Blk(val r: Rect, val text: String, val lh: Int)
+    private class Fit(val r: Rect, val bg: Int)
+
+    suspend fun run(bmp: Bitmap, minTop: Int = 0): List<Item> {
+        val t = try { rec.process(InputImage.fromBitmap(bmp, 0)).await() } catch (e: Exception) { return emptyList() }
+        return withContext(Dispatchers.Default) { build(bmp, t, minTop) }
+    }
+
+    private fun build(bmp: Bitmap, t: Text, minTop: Int): List<Item> {
+        val raw = ArrayList<Blk>()
+        for (b in t.textBlocks) {
+            val bb = b.boundingBox ?: continue
+            if (bb.top < minTop) continue
+            if (b.lines.isNotEmpty() && b.lines.map { it.confidence }.average() < 0.35) continue
+            val s = clean(b.text)
+            if (junkRe.containsMatchIn(s)) continue // ลายน้ำ/URL
+            val hs = b.lines.mapNotNull { it.boundingBox?.height() }.sorted()
+            raw.add(Blk(Rect(bb), s, if (hs.isEmpty()) bb.height() else hs[hs.size / 2]))
+        }
+        val blocks = if (Prefs.merge) merge(bmp, raw) else raw
+        val out = ArrayList<Item>()
+        for (b in blocks.sortedWith(compareBy({ it.r.top }, { it.r.left }))) {
+            val letters = b.text.count { it.isLetter() }
+            if (letters < 2 && b.text != "I" && b.text != "A") continue
+            if (noLetterRe.matches(b.text)) continue
+            val f = if (Prefs.fit) fit(bmp, b.r) else null
+            out.add(Item(f?.r ?: Rect(b.r), normalize(b.text), f?.bg ?: bgOf(bmp, b.r), f != null))
+        }
+        return out
+    }
+
+    /** แก้ที่ OCR อ่านผิดบ่อยในฟอนต์มังงะ */
+    private fun clean(s0: String): String {
+        var s = s0.replace("-\n", "").replace("\n", " ")
+            .replace('\u2019', '\'').replace('\u2018', '\'').replace('\u201C', '"').replace('\u201D', '"')
+            .replace('|', 'I')
+        s = s.replace(Regex("(?<=[A-Z])0(?=[A-Z])"), "O").replace(Regex("(?<=[A-Z])1(?=[A-Z])"), "I")
+        s = s.replace(Regex("(?i)(?<=[a-z])\\s*'\\s*(?=(?:t|s|m|d|ll|re|ve)\\b)"), "'")
+        return s.replace(Regex("\\s+"), " ").trim()
+    }
+
+    // ---------- รวมบล็อกที่อยู่ในกรอบคำพูดเดียวกัน ----------
+    private fun merge(bmp: Bitmap, a: List<Blk>): List<Blk> {
+        val n = a.size
+        val p = IntArray(n) { it }
+        fun f(x: Int): Int { var y = x; while (p[y] != y) { p[y] = p[p[y]]; y = p[y] }; return y }
+        for (i in 0 until n) for (j in i + 1 until n) if (same(bmp, a[i], a[j])) p[f(i)] = f(j)
+        return (0 until n).groupBy { f(it) }.values.map { g ->
+            val m = g.map { a[it] }.sortedBy { it.r.top }
+            val r = Rect(m[0].r)
+            m.forEach { r.union(it.r) }
+            Blk(r, m.joinToString(" ") { it.text }, m.map { it.lh }.sorted()[m.size / 2])
+        }
+    }
+
+    private fun same(bmp: Bitmap, a: Blk, b: Blk): Boolean {
+        val u = if (a.r.top <= b.r.top) a else b
+        val d = if (u === a) b else a
+        val lo = min(u.lh, d.lh).coerceAtLeast(1)
+        if (max(u.lh, d.lh).toFloat() / lo > 1.5f) return false
+        val ov = min(u.r.right, d.r.right) - max(u.r.left, d.r.left)
+        if (ov < 0.3f * min(u.r.width(), d.r.width())) return false
+        val gap = d.r.top - u.r.bottom
+        if (gap > 1.1f * lo) return false
+        if (gap <= 0) return true
+        return !divided(bmp, max(u.r.left, d.r.left), min(u.r.right, d.r.right), u.r.bottom, d.r.top)
+    }
+
+    private fun lumAt(bmp: Bitmap, x: Int, y: Int): Int {
+        val p = bmp.getPixel(x.coerceIn(0, bmp.width - 1), y.coerceIn(0, bmp.height - 1))
+        return (77 * Color.red(p) + 150 * Color.green(p) + 29 * Color.blue(p)) shr 8
+    }
+
+    /** มีเส้นขอบกรอบคำพูดคั่นระหว่างสองบล็อกไหม (สแกนแนวตั้ง 3 เส้น ต้องเจอขอบอย่างน้อย 2 เส้น) */
+    private fun divided(bmp: Bitmap, x0: Int, x1: Int, y0: Int, y1: Int): Boolean {
+        if (y1 - y0 < 3) return false
+        var hits = 0
+        for (k in 1..3) {
+            val x = x0 + (x1 - x0) * k / 4
+            val ref = lumAt(bmp, x, y0 + 1)
+            var run = 0; var hit = false
+            for (y in y0 + 1 until y1) {
+                if (abs(lumAt(bmp, x, y) - ref) > 70) { run++; if (run >= 2) { hit = true; break } } else run = 0
             }
-            .addOnFailureListener { c.resume(emptyList()) }
+            if (hit) hits++
+        }
+        return hits >= 2
+    }
+
+    // ---------- หากรอบคำพูดรอบข้อความ ----------
+    private fun fit(bmp: Bitmap, t: Rect): Fit? {
+        val m = (max(t.width(), t.height()) * 0.8f).toInt().coerceIn(48, 360)
+        val cl = max(0, t.left - m); val ct = max(0, t.top - m)
+        val cr = min(bmp.width, t.right + m); val cb = min(bmp.height, t.bottom + m)
+        val w = cr - cl; val h = cb - ct
+        val gw = w / ST; val gh = h / ST
+        if (gw < 12 || gh < 12) return null
+        val px = IntArray(w * h)
+        bmp.getPixels(px, 0, w, cl, ct, w, h)
+        val lum = IntArray(gw * gh)
+        for (y in 0 until gh) for (x in 0 until gw) {
+            val p = px[y * ST * w + x * ST]
+            lum[y * gw + x] = (77 * Color.red(p) + 150 * Color.green(p) + 29 * Color.blue(p)) shr 8
+        }
+        val tl = (t.left - cl) / ST; val tt = (t.top - ct) / ST
+        val tr = (t.right - cl) / ST; val tb = (t.bottom - ct) / ST
+        val k = 3; val cx = (tl + tr) / 2; val cy = (tt + tb) / 2
+        val seeds = listOf(
+            Pair(cx, tt - k), Pair(cx, tb + k), Pair(tl - k, cy), Pair(tr + k, cy),
+            Pair(tl - k, tt - k), Pair(tr + k, tt - k), Pair(tl - k, tb + k), Pair(tr + k, tb + k))
+        val seen = BooleanArray(gw * gh)
+        val q = IntArray(gw * gh)
+        var best: IntArray? = null   // x0, y0, x1, y1, area
+        var bestColor = Color.WHITE
+        for ((sx, sy) in seeds) {
+            if (sx < 0 || sy < 0 || sx >= gw || sy >= gh || seen[sy * gw + sx]) continue
+            val ref = lum[sy * gw + sx]
+            var qh = 0; var qt = 0
+            q[qt++] = sy * gw + sx; seen[sy * gw + sx] = true
+            var x0 = sx; var x1 = sx; var y0 = sy; var y1 = sy; var area = 0
+            while (qh < qt) {
+                val c = q[qh++]; val x = c % gw; val y = c / gw
+                area++
+                if (x < x0) x0 = x
+                if (x > x1) x1 = x
+                if (y < y0) y0 = y
+                if (y > y1) y1 = y
+                if (x > 0 && !seen[c - 1] && abs(lum[c - 1] - ref) <= TOL) { seen[c - 1] = true; q[qt++] = c - 1 }
+                if (x < gw - 1 && !seen[c + 1] && abs(lum[c + 1] - ref) <= TOL) { seen[c + 1] = true; q[qt++] = c + 1 }
+                if (y > 0 && !seen[c - gw] && abs(lum[c - gw] - ref) <= TOL) { seen[c - gw] = true; q[qt++] = c - gw }
+                if (y < gh - 1 && !seen[c + gw] && abs(lum[c + gw] - ref) <= TOL) { seen[c + gw] = true; q[qt++] = c + gw }
+            }
+            if (best == null || area > best[4]) { best = intArrayOf(x0, y0, x1, y1, area); bestColor = px[sy * ST * w + sx * ST] }
+        }
+        val b = best ?: return null
+        val sides = (if (b[0] <= 0) 1 else 0) + (if (b[1] <= 0) 1 else 0) + (if (b[2] >= gw - 1) 1 else 0) + (if (b[3] >= gh - 1) 1 else 0)
+        if (sides >= 3 || b[4] > 0.92f * gw * gh) return null // รั่วออกนอกกรอบ = ไม่ใช่กรอบคำพูด
+        val bw = b[2] - b[0] + 1; val bh = b[3] - b[1] + 1
+        val bounds = Rect(cl + b[0] * ST, ct + b[1] * ST, cl + (b[2] + 1) * ST, ct + (b[3] + 1) * ST)
+        if (bounds.width() < t.width() || bounds.height() < t.height()) return null
+        // กรอบสี่เหลี่ยมใช้เกือบเต็ม, กรอบวงรีใช้ส่วนที่ปลอดภัยภายใน
+        val k2 = if (b[4].toFloat() / (bw * bh) > 0.86f) 0.94f else 0.78f
+        val hw = (bounds.width() / 2f * k2).toInt(); val hh = (bounds.height() / 2f * k2).toInt()
+        val r = Rect(bounds.centerX() - hw, bounds.centerY() - hh, bounds.centerX() + hw, bounds.centerY() + hh)
+        r.union(Rect(t.left - 4, t.top - 4, t.right + 4, t.bottom + 4))
+        if (!r.intersect(bounds)) return null
+        return Fit(r, Color.rgb(Color.red(bestColor), Color.green(bestColor), Color.blue(bestColor)))
     }
 
     /** ตัวพิมพ์ใหญ่ล้วนในมังงะ -> sentence case ให้ Google แปลแม่นขึ้น */
@@ -54,19 +195,47 @@ object Ocr {
         return sb.toString().replace(Regex("\\bi\\b"), "I").replace(Regex("\\bi'"), "I'")
     }
 
-    /** สีพื้นกรอบคำพูด: เฉลี่ยจากจุดใกล้ขอบ/มุม */
+    /** สีพื้นกรอบคำพูด (สำรอง): มัธยฐานจากจุด 8 จุดรอบนอกข้อความ */
     private fun bgOf(bmp: Bitmap, r: Rect): Int {
-        val xs = intArrayOf(r.left + 3, (r.left + r.right) / 2, r.right - 3)
-        val ys = intArrayOf(r.top + 3, (r.top + r.bottom) / 2, r.bottom - 3)
-        var R = 0; var G = 0; var B = 0; var n = 0
+        val xs = intArrayOf(r.left - 5, (r.left + r.right) / 2, r.right + 5)
+        val ys = intArrayOf(r.top - 5, (r.top + r.bottom) / 2, r.bottom + 5)
+        val l = ArrayList<Int>()
         for (xi in 0..2) for (yi in 0..2) {
             if (xi == 1 && yi == 1) continue
-            val x = xs[xi]; val y = ys[yi]
-            if (x in 0 until bmp.width && y in 0 until bmp.height) {
-                val p = bmp.getPixel(x, y); R += Color.red(p); G += Color.green(p); B += Color.blue(p); n++
-            }
+            l.add(bmp.getPixel(xs[xi].coerceIn(0, bmp.width - 1), ys[yi].coerceIn(0, bmp.height - 1)))
         }
-        return if (n == 0) Color.WHITE else Color.rgb(R / n, G / n, B / n)
+        l.sortBy { 77 * Color.red(it) + 150 * Color.green(it) + 29 * Color.blue(it) }
+        val p = l[l.size / 2]
+        return Color.rgb(Color.red(p), Color.green(p), Color.blue(p))
+    }
+}
+
+/** คำเรียกต่อท้าย/ศัพท์มังงะ + ศัพท์เฉพาะของผู้ใช้ (ชื่อตัวละคร) ใส่เป็นภาษาไทยก่อนส่งให้ Google */
+object Glossary {
+    private val terms = listOf(
+        "onii-chan" to "โอนี่จัง", "oniichan" to "โอนี่จัง", "onee-chan" to "โอเนะจัง", "oneechan" to "โอเนะจัง",
+        "onii-san" to "โอนี่ซัง", "onee-san" to "โอเนะซัง", "senpai" to "เซมไป", "sensei" to "เซนเซ", "kouhai" to "โคไฮ")
+    private val suffixes = listOf("san" to "ซัง", "kun" to "คุง", "chan" to "จัง", "sama" to "ซามะ", "dono" to "โดโนะ", "sensei" to "เซนเซ", "senpai" to "เซมไป")
+    private val joinRe = Regex("\\s+(ซัง|คุง|จัง|ซามะ|โดโนะ|เซนเซ|เซมไป)")
+
+    fun pre(s: String): String {
+        var t = s
+        for ((a, b) in terms) t = t.replace(Regex("(?i)(?<![A-Za-z])" + Regex.escape(a) + "(?![A-Za-z])"), b)
+        for ((a, b) in suffixes) t = t.replace(Regex("(?i)(?<=[A-Za-z])-" + a + "(?![A-Za-z])"), " $b")
+        for (line in Prefs.glossary.lines()) {
+            val i = line.indexOf('=')
+            if (i <= 0) continue
+            val k = line.substring(0, i).trim(); val v = line.substring(i + 1).trim()
+            if (k.isEmpty() || v.isEmpty()) continue
+            t = t.replace(Regex("(?i)(?<![A-Za-z])" + Regex.escape(k) + "(?![A-Za-z])"), v)
+        }
+        return t
+    }
+
+    fun post(s: String): String {
+        var t = s.replace(joinRe, "$1").replace(Regex("\\s+([!?…])"), "$1")
+        if (t.endsWith(".") && !t.endsWith("..")) t = t.dropLast(1)
+        return t
     }
 }
 
@@ -158,7 +327,7 @@ object Translator {
     @Volatile private var googleFails = 0
     @Volatile private var googleDownUntil = 0L
 
-    fun init(ctx: Context) { app = ctx.applicationContext }
+    fun init(ctx: Context) { app = ctx.applicationContext; cache.evictAll() }
     private fun status(m: String) { onStatus?.invoke(m) }
     private fun setEngine(e: String) { if (e != lastEngine) { lastEngine = e; status("แปลด้วย: $e") } }
 
@@ -212,10 +381,11 @@ object Translator {
 
     private suspend fun google(chunk: List<String>): Map<String, String> {
         val out = HashMap<String, String>()
-        val joined = callRetry(chunk.joinToString("\n"))?.split("\n")
-        if (joined != null && joined.size == chunk.size) chunk.indices.forEach { out[chunk[it]] = joined[it].trim() }
+        val pre = chunk.map { Glossary.pre(it) }
+        val joined = callRetry(pre.joinToString("\n"))?.split("\n")
+        if (joined != null && joined.size == chunk.size) chunk.indices.forEach { out[chunk[it]] = Glossary.post(joined[it].trim()) }
         else if (joined != null) coroutineScope {
-            chunk.map { q -> async { callRetry(q)?.let { r -> synchronized(out) { out[q] = r.trim() } } } }.awaitAll()
+            chunk.indices.map { i -> async { callRetry(pre[i])?.let { r -> synchronized(out) { out[chunk[i]] = Glossary.post(r.trim()) } } } }.awaitAll()
         }
         return out
     }

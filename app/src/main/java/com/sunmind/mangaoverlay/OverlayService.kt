@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.*
 import android.graphics.drawable.GradientDrawable
+import android.text.Layout
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.*
@@ -47,6 +48,7 @@ class OverlayService : Service() {
         if (i == null || capture != null) return START_NOT_STICKY
         startFg()
         OpenCVLoader.initLocal()
+        Prefs.init(applicationContext)
         Translator.init(applicationContext)
         Translator.onStatus = { m -> main.post { toast(m) } }
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
@@ -152,7 +154,7 @@ class OverlayService : Service() {
     // ---------- OCR + translate ----------
     private suspend fun full() {
         if (busy) return
-        busy = true
+        busy = true; ui(true)
         try {
             val hide = container.visibility == View.VISIBLE && container.childCount > 0
             container.removeAllViews()
@@ -164,7 +166,7 @@ class OverlayService : Service() {
             bmp.recycle()
             if (items.isEmpty()) toast("ไม่พบข้อความในหน้านี้")
             addItems(items, 1f, 0f, 0f)
-        } finally { busy = false }
+        } finally { busy = false; ui(false) }
     }
 
     private suspend fun onSettle() {
@@ -177,7 +179,7 @@ class OverlayService : Service() {
     /** OCR เฉพาะแถบใหม่ที่เลื่อนเข้ามา (ไม่ซ่อนโอเวอร์เลย์ เพราะแถบใหม่ยังไม่มีข้อความทับ) */
     private suspend fun strip() {
         if (busy || !active) return
-        busy = true
+        busy = true; ui(true)
         try {
             val moved = accDy
             val margin = (H * 0.1f).toInt()
@@ -192,7 +194,7 @@ class OverlayService : Service() {
             accDy -= moved
             addItems(items.filter { it.r.top >= H * 0.04f }, s0, x0, yy0)
             prune()
-        } finally { busy = false }
+        } finally { busy = false; ui(false) }
     }
 
     /** items อยู่ในพิกัดหน้าจอ ณ เวลา snapshot (s0,x0,y0) -> แปลงเป็น local; วางกรอบทันที แล้วเติมข้อความไทยเมื่อแปลเสร็จ */
@@ -201,8 +203,9 @@ class OverlayService : Service() {
         val views = ArrayList<Pair<TextView, Item>>()
         for (item in items.take(40)) {
             val r = item.r
-            val l = (r.left - 6 - x0) / s0; val t = (r.top - 6 - y0) / s0
-            val w = (r.width() + 12) / s0; val h = (r.height() + 12) / s0
+            val pd = if (item.bubble) 0 else 6
+            val l = (r.left - pd - x0) / s0; val t = (r.top - pd - y0) / s0
+            val w = (r.width() + 2 * pd) / s0; val h = (r.height() + 2 * pd) / s0
             val nr = RectF(l, t, l + w, t + h)
             var skip = false
             for (j in container.childCount - 1 downTo 0) {
@@ -234,8 +237,11 @@ class OverlayService : Service() {
         gravity = Gravity.CENTER; setPadding(4, 2, 4, 2)
         val lum = 0.299 * Color.red(bg) + 0.587 * Color.green(bg) + 0.114 * Color.blue(bg)
         setTextColor(if (lum > 140) Color.BLACK else Color.WHITE)
-        background = GradientDrawable().apply { setColor(Color.argb(0xF5, Color.red(bg), Color.green(bg), Color.blue(bg))); cornerRadius = 10f }
-        TextViewCompat.setAutoSizeTextTypeUniformWithConfiguration(this, 8, 26, 2, TypedValue.COMPLEX_UNIT_SP)
+        background = GradientDrawable().apply { setColor(Color.rgb(Color.red(bg), Color.green(bg), Color.blue(bg))); cornerRadius = 10f }
+        breakStrategy = Layout.BREAK_STRATEGY_BALANCED       // ตัดบรรทัดให้สมดุลเหมือนในกรอบคำพูด
+        hyphenationFrequency = Layout.HYPHENATION_FREQUENCY_NONE
+        if (Prefs.bold) typeface = Typeface.DEFAULT_BOLD
+        TextViewCompat.setAutoSizeTextTypeUniformWithConfiguration(this, 7, 28, 1, TypedValue.COMPLEX_UNIT_SP)
     }
 
     private fun prune() {
@@ -246,6 +252,8 @@ class OverlayService : Service() {
         }
         updateMask()
     }
+
+    private fun ui(b: Boolean) { if (::btn.isInitialized) btn.text = if (b) "…" else "文" }
 
     private fun toast(m: String) = Toast.makeText(this, m, Toast.LENGTH_SHORT).show()
 

@@ -4,7 +4,7 @@ android {
     compileSdk = 34
     defaultConfig {
         applicationId = "com.sunmind.mangaoverlay"
-        minSdk = 26; targetSdk = 34; versionCode = 1; versionName = "1.0"
+        minSdk = 26; targetSdk = 34; versionCode = 3; versionName = "3.0"
         ndk { abiFilters += "arm64-v8a" }
     }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
