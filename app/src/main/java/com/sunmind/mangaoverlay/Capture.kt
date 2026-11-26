@@ -54,21 +54,31 @@ class Capture(proj: MediaProjection, val w: Int, val h: Int, dpi: Int) {
         p.buffer.rewind()
         val bmp = Bitmap.createBitmap(bw, img.height, Bitmap.Config.ARGB_8888)
         bmp.copyPixelsFromBuffer(p.buffer)
-        return if (bw == img.width) bmp else Bitmap.createBitmap(bmp, 0, 0, img.width, img.height)
+        if (bw == img.width) return bmp
+        val cropped = Bitmap.createBitmap(bmp, 0, 0, img.width, img.height)
+        bmp.recycle()
+        return cropped
     }
 
     /** Hides our own overlay views, waits for a clean frame, returns full-res bitmap. */
     suspend fun snapshot(hide: List<View>, wait: Boolean): Bitmap {
         val f0 = frames
         hide.forEach { it.visibility = View.INVISIBLE }
-        var t = 0
-        while (held == null && t < 2000) { delay(16); t += 16 }
-        if (wait) { t = 0; while (frames == f0 && t < 250) { delay(16); t += 16 }; delay(32) }
-        val bmp = suspendCancellableCoroutine<Bitmap> { c ->
-            handler.post { try { c.resume(toBitmap(held!!)) } catch (e: Throwable) { c.resumeWithException(e) } }
+        try {
+            var t = 0
+            while (held == null && t < 2000) { delay(16); t += 16 }
+            if (held == null) throw IllegalStateException("no frame")
+            if (wait) { t = 0; while (frames == f0 && t < 250) { delay(16); t += 16 }; delay(32) }
+            return suspendCancellableCoroutine { c ->
+                handler.post {
+                    try { c.resume(toBitmap(held ?: throw IllegalStateException("no frame"))) }
+                    catch (e: Throwable) { c.resumeWithException(e) }
+                }
+            }
+        } finally {
+            // คืนการมองเห็นเสมอ แม้เกิด error/ถูกยกเลิก ไม่งั้นโอเวอร์เลย์หายถาวร
+            hide.forEach { it.visibility = View.VISIBLE }
         }
-        hide.forEach { it.visibility = View.VISIBLE }
-        return bmp
     }
 
     fun release() {

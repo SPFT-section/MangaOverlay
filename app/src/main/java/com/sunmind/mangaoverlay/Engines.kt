@@ -38,8 +38,12 @@ object Ocr {
     private class Fit(val r: Rect, val bg: Int)
 
     suspend fun run(bmp: Bitmap, minTop: Int = 0): List<Item> {
-        val t = try { rec.process(InputImage.fromBitmap(bmp, 0)).await() } catch (e: Exception) { return emptyList() }
-        return withContext(Dispatchers.Default) { build(bmp, t, minTop) }
+        val t = try { rec.process(InputImage.fromBitmap(bmp, 0)).await() }
+                catch (e: CancellationException) { throw e }   // ห้ามกลืน cancellation
+                catch (e: Exception) { return emptyList() }
+        return withContext(Dispatchers.Default) {
+            try { build(bmp, t, minTop) } catch (e: Exception) { emptyList() } // กันกรอบ/พิกเซลเกินขอบจนแอปล้ม
+        }
     }
 
     private fun build(bmp: Bitmap, t: Text, minTop: Int): List<Item> {
@@ -212,23 +216,38 @@ object Ocr {
 
 /** คำเรียกต่อท้าย/ศัพท์มังงะ + ศัพท์เฉพาะของผู้ใช้ (ชื่อตัวละคร) ใส่เป็นภาษาไทยก่อนส่งให้ Google */
 object Glossary {
+    private fun word(a: String) = Regex("(?i)(?<![A-Za-z])" + Regex.escape(a) + "(?![A-Za-z])")
     private val terms = listOf(
         "onii-chan" to "โอนี่จัง", "oniichan" to "โอนี่จัง", "onee-chan" to "โอเนะจัง", "oneechan" to "โอเนะจัง",
-        "onii-san" to "โอนี่ซัง", "onee-san" to "โอเนะซัง", "senpai" to "เซมไป", "sensei" to "เซนเซ", "kouhai" to "โคไฮ")
+        "onii-san" to "โอนี่ซัง", "onee-san" to "โอเนะซัง", "senpai" to "เซมไป", "sensei" to "เซนเซ", "kouhai" to "โคไฮ"
+    ).map { (a, b) -> word(a) to b }
     private val suffixes = listOf("san" to "ซัง", "kun" to "คุง", "chan" to "จัง", "sama" to "ซามะ", "dono" to "โดโนะ", "sensei" to "เซนเซ", "senpai" to "เซมไป")
-    private val joinRe = Regex("\\s+(ซัง|คุง|จัง|ซามะ|โดโนะ|เซนเซ|เซมไป)")
+        .map { (a, b) -> Regex("(?i)(?<=[A-Za-z])-" + a + "(?![A-Za-z])") to " $b" }
+    // ต้องเป็นคำลงท้ายจริง (ตามด้วยช่องว่าง/วรรคตอน/จบข้อความ) ไม่งั้น "จังหวะ" ฯลฯ จะถูกต่อติดคำหน้า
+    private val joinRe = Regex("\\s+(ซัง|คุง|จัง|ซามะ|โดโนะ|เซนเซ|เซมไป)(?=\\s|$|[!?…,.\"'”)])")
+
+    @Volatile private var userKey: String? = null
+    @Volatile private var userRules: List<Pair<Regex, String>> = emptyList()
+
+    private fun user(): List<Pair<Regex, String>> {
+        val g = Prefs.glossary
+        if (g != userKey) {
+            userRules = g.lines().mapNotNull { line ->
+                val i = line.indexOf('=')
+                if (i <= 0) return@mapNotNull null
+                val k = line.substring(0, i).trim(); val v = line.substring(i + 1).trim()
+                if (k.isEmpty() || v.isEmpty()) null else word(k) to v
+            }.sortedByDescending { it.first.pattern.length } // วลียาวก่อน เช่น "Straw Hat Pirates" ก่อน "Straw Hat"
+            userKey = g
+        }
+        return userRules
+    }
 
     fun pre(s: String): String {
         var t = s
-        for ((a, b) in terms) t = t.replace(Regex("(?i)(?<![A-Za-z])" + Regex.escape(a) + "(?![A-Za-z])"), b)
-        for ((a, b) in suffixes) t = t.replace(Regex("(?i)(?<=[A-Za-z])-" + a + "(?![A-Za-z])"), " $b")
-        for (line in Prefs.glossary.lines()) {
-            val i = line.indexOf('=')
-            if (i <= 0) continue
-            val k = line.substring(0, i).trim(); val v = line.substring(i + 1).trim()
-            if (k.isEmpty() || v.isEmpty()) continue
-            t = t.replace(Regex("(?i)(?<![A-Za-z])" + Regex.escape(k) + "(?![A-Za-z])"), v)
-        }
+        for ((r, b) in terms) t = r.replace(t, Regex.escapeReplacement(b))
+        for ((r, b) in suffixes) t = r.replace(t, Regex.escapeReplacement(b))
+        for ((r, v) in user()) t = r.replace(t, Regex.escapeReplacement(v))
         return t
     }
 
@@ -270,8 +289,8 @@ object Dict {
     fun lookup(word: String): String? {
         val m = map ?: return null
         val k = word.lowercase()
-        m[k]?.let { return it }
-        irregular[k]?.let { b -> m[b]?.let { return it } }
+        m[k]?.takeIf { it.isNotBlank() }?.let { return it }
+        irregular[k]?.let { b -> m[b]?.takeIf { it.isNotBlank() }?.let { return it } }
         val c = ArrayList<String>()
         if (k.endsWith("ies")) c.add(k.dropLast(3) + "y")
         if (k.endsWith("ied")) c.add(k.dropLast(3) + "y")
@@ -280,7 +299,7 @@ object Dict {
         if (k.endsWith("ed")) { c.add(k.dropLast(2)); c.add(k.dropLast(1)); if (k.length > 4 && k[k.length - 3] == k[k.length - 4]) c.add(k.dropLast(3)) }
         if (k.endsWith("ing")) { val b = k.dropLast(3); c.add(b); c.add(b + "e"); if (b.length > 2 && b.last() == b[b.length - 2]) c.add(b.dropLast(1)) }
         if (k.endsWith("ly")) c.add(k.dropLast(2))
-        for (x in c) m[x]?.let { return it }
+        for (x in c) m[x]?.takeIf { it.isNotBlank() }?.let { return it }
         return null
     }
 
@@ -317,10 +336,11 @@ object Translator {
     private lateinit var app: Context
     @Volatile var onStatus: ((String) -> Unit)? = null
     private val cache = LruCache<String, String>(5000)
-    private val offline by lazy {
-        Translation.getClient(TranslatorOptions.Builder()
-            .setSourceLanguage(TranslateLanguage.ENGLISH).setTargetLanguage(TranslateLanguage.THAI).build())
-    }
+    private fun newClient() = Translation.getClient(TranslatorOptions.Builder()
+        .setSourceLanguage(TranslateLanguage.ENGLISH).setTargetLanguage(TranslateLanguage.THAI).build())
+    @Volatile private var client: com.google.mlkit.nl.translate.Translator? = null
+    private val offline: com.google.mlkit.nl.translate.Translator
+        @Synchronized get() = client ?: newClient().also { client = it }
     @Volatile private var offlineReady = false
     @Volatile private var lastErr = ""
     @Volatile private var lastEngine = ""
@@ -328,6 +348,12 @@ object Translator {
     @Volatile private var googleDownUntil = 0L
 
     fun init(ctx: Context) { app = ctx.applicationContext; cache.evictAll() }
+
+    /** ปล่อยโมเดล/ตัวแปลเมื่อปิดบริการ (init ครั้งถัดไปจะสร้างใหม่เอง) */
+    @Synchronized fun close() {
+        onStatus = null
+        client?.close(); client = null; offlineReady = false
+    }
     private fun status(m: String) { onStatus?.invoke(m) }
     private fun setEngine(e: String) { if (e != lastEngine) { lastEngine = e; status("แปลด้วย: $e") } }
 
@@ -399,6 +425,7 @@ object Translator {
             try {
                 if (!post && enc.length > 3500) continue
                 val c = URL(if (post) base else "$base&q=$enc").openConnection() as HttpURLConnection
+                try {
                 c.connectTimeout = 3000; c.readTimeout = 4000
                 c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36")
                 if (post) {
@@ -407,8 +434,9 @@ object Translator {
                     c.outputStream.use { it.write(("q=" + enc).toByteArray()) }
                 }
                 if (c.responseCode != 200) { lastErr = "HTTP ${c.responseCode}"; continue }
-                val j = JSONArray(c.inputStream.bufferedReader().readText()).getJSONArray(0)
+                val j = JSONArray(c.inputStream.bufferedReader().use { it.readText() }).getJSONArray(0)
                 return buildString { for (i in 0 until j.length()) append(j.getJSONArray(i).getString(0)) }
+                } finally { c.disconnect() }
             } catch (e: Exception) { lastErr = e.javaClass.simpleName }
         }
         return null

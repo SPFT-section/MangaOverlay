@@ -1,6 +1,8 @@
 package com.sunmind.mangaoverlay
 
 import android.app.Activity
+import android.content.pm.PackageManager
+import kotlinx.coroutines.runBlocking
 import android.content.Intent
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
@@ -12,6 +14,7 @@ import android.widget.*
 
 class MainActivity : Activity() {
     private val reqCap = 1
+    private val reqNotif = 2
     private lateinit var out: TextView
     private lateinit var cbMerge: CheckBox
     private lateinit var cbFit: CheckBox
@@ -52,29 +55,50 @@ class MainActivity : Activity() {
     private fun lookup(q: String) {
         if (q.isEmpty()) return
         out.text = "กำลังค้นหา..."
+        val app = applicationContext
         Thread {
-            Dict.load(this)
-            val single = !q.contains(' ')
-            val r = if (single) (Dict.lookup(q)?.split(';')?.filter { it.isNotBlank() }?.joinToString("\n• ", "• ") ?: "ไม่พบคำนี้")
-                    else Dict.translate(q).ifBlank { "แปลไม่ได้" }
-            runOnUiThread { out.text = r }
+            val r = try {
+                Dict.load(app)
+                if (!q.contains(' ')) {
+                    Dict.lookup(q)?.split(';')?.filter { it.isNotBlank() }?.joinToString("\n• ", "• ") ?: "ไม่พบคำนี้"
+                } else {
+                    Translator.init(app)
+                    // Google -> ML Kit ออฟไลน์ -> พจนานุกรม (ตามลำดับเดียวกับโอเวอร์เลย์)
+                    runBlocking { Translator.translate(listOf(q)) }.firstOrNull() ?: "แปลไม่ได้"
+                }
+            } catch (e: Exception) { "เกิดข้อผิดพลาด: ${e.javaClass.simpleName}" }
+            runOnUiThread { if (!isDestroyed) out.text = r }
         }.start()
     }
 
     private fun start() {
         save()
         if (!Settings.canDrawOverlays(this)) {
+            Toast.makeText(this, "กรุณาอนุญาต \"แสดงทับแอปอื่น\" แล้วกดเริ่มอีกครั้ง", Toast.LENGTH_LONG).show()
             startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))); return
         }
-        if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 0)
+        // ขอสิทธิ์แจ้งเตือนก่อน แล้วค่อยขอจับภาพหน้าจอ (ถ้าขอพร้อมกัน dialog จะทับกัน)
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), reqNotif)
+        } else launchCapture()
+    }
+
+    private fun launchCapture() =
         startActivityForResult(getSystemService(MediaProjectionManager::class.java).createScreenCaptureIntent(), reqCap)
+
+    override fun onRequestPermissionsResult(r: Int, p: Array<out String>, g: IntArray) {
+        super.onRequestPermissionsResult(r, p, g)
+        if (r == reqNotif) launchCapture() // แม้ไม่อนุญาตแจ้งเตือน บริการก็ยังทำงานได้
     }
 
     @Deprecated("ok")
     override fun onActivityResult(r: Int, c: Int, d: Intent?) {
-        if (r == reqCap && c == RESULT_OK && d != null) {
+        super.onActivityResult(r, c, d)
+        if (r != reqCap) return
+        if (c == RESULT_OK && d != null) {
             startForegroundService(Intent(this, OverlayService::class.java).putExtra("code", c).putExtra("data", d))
             finish()
-        }
+        } else Toast.makeText(this, "ยังไม่ได้อนุญาตการจับภาพหน้าจอ", Toast.LENGTH_SHORT).show()
     }
 }

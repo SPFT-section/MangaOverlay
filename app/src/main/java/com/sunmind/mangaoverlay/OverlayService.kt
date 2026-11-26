@@ -2,6 +2,8 @@ package com.sunmind.mangaoverlay
 
 import android.app.*
 import android.content.Intent
+import android.content.res.Configuration
+import android.graphics.drawable.Icon
 import android.content.pm.ServiceInfo
 import android.graphics.*
 import android.graphics.drawable.GradientDrawable
@@ -30,6 +32,8 @@ class OverlayService : Service() {
     private lateinit var btn: TextView
     private var btnLp: WLP? = null
     private var proj: MediaProjection? = null
+    private var projCb: MediaProjection.Callback? = null
+    private var stopping = false
     private var capture: Capture? = null
     private lateinit var tracker: Tracker
     private val main = Handler(Looper.getMainLooper())
@@ -44,34 +48,61 @@ class OverlayService : Service() {
 
     override fun onBind(i: Intent?): IBinder? = null
 
+    companion object { const val ACTION_STOP = "com.sunmind.mangaoverlay.STOP" }
+
     override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
-        if (i == null || capture != null) return START_NOT_STICKY
+        // startForegroundService() บังคับให้เรียก startForeground() ภายใน 5 วิ ทุกครั้ง ไม่งั้นแอปล้ม (รวมกรณีกด Start ซ้ำ)
         startFg()
-        OpenCVLoader.initLocal()
-        Prefs.init(applicationContext)
-        Translator.init(applicationContext)
-        Translator.onStatus = { m -> main.post { toast(m) } }
-        wm = getSystemService(WINDOW_SERVICE) as WindowManager
-        val dm = DisplayMetrics(); @Suppress("DEPRECATION") wm.defaultDisplay.getRealMetrics(dm)
-        W = dm.widthPixels; H = dm.heightPixels
-        tracker = Tracker(W / Q, H / Q)
-        val data = if (Build.VERSION.SDK_INT >= 33) i.getParcelableExtra("data", Intent::class.java)
-                   else @Suppress("DEPRECATION") i.getParcelableExtra("data")
-        proj = getSystemService(MediaProjectionManager::class.java).getMediaProjection(i.getIntExtra("code", 0), data!!)
-        proj!!.registerCallback(object : MediaProjection.Callback() { override fun onStop() { stopSelf() } }, main)
-        capture = Capture(proj!!, W, H, dm.densityDpi).also { c ->
-            c.onGray = { g -> tracker.step(g, mask)?.let { s -> main.post { applyStep(s) } } }
+        if (i == null || i.action == ACTION_STOP) { stopSelf(); return START_NOT_STICKY }
+        if (capture != null) return START_NOT_STICKY
+        try {
+            if (!OpenCVLoader.initLocal()) toast("โหลด OpenCV ไม่สำเร็จ การติดตามการเลื่อนหน้าอาจไม่ทำงาน")
+            Prefs.init(applicationContext)
+            Translator.init(applicationContext)
+            Translator.onStatus = { m -> main.post { toast(m) } }
+            wm = getSystemService(WINDOW_SERVICE) as WindowManager
+            val dm = DisplayMetrics(); @Suppress("DEPRECATION") wm.defaultDisplay.getRealMetrics(dm)
+            W = dm.widthPixels; H = dm.heightPixels
+            tracker = Tracker(W / Q, H / Q)
+            val data = if (Build.VERSION.SDK_INT >= 33) i.getParcelableExtra("data", Intent::class.java)
+                       else @Suppress("DEPRECATION") i.getParcelableExtra("data")
+            if (data == null) { toast("ไม่ได้รับสิทธิ์จับภาพหน้าจอ"); stopSelf(); return START_NOT_STICKY }
+            val mp = getSystemService(MediaProjectionManager::class.java).getMediaProjection(i.getIntExtra("code", 0), data)
+            proj = mp
+            val cb = object : MediaProjection.Callback() { override fun onStop() { stopSelf() } }
+            projCb = cb
+            mp.registerCallback(cb, main)
+            capture = Capture(mp, W, H, dm.densityDpi).also { c ->
+                c.onGray = { g -> tracker.step(g, mask)?.let { s -> main.post { applyStep(s) } } }
+            }
+            buildLayer(); buildButton()
+            scope.launch { Translator.warmUp() }
+        } catch (e: Exception) {
+            toast("เริ่มไม่ได้: ${e.javaClass.simpleName}")
+            stopSelf()
         }
-        buildLayer(); buildButton()
-        scope.launch { Translator.warmUp() }
         return START_NOT_STICKY
+    }
+
+    /** หมุนจอ = ขนาดเฟรมไม่ตรงกับที่ตั้งไว้ ตำแหน่งคำแปลจะเพี้ยน จึงหยุดอย่างชัดเจนให้เริ่มใหม่ */
+    override fun onConfigurationChanged(c: Configuration) {
+        super.onConfigurationChanged(c)
+        if (capture == null || stopping) return
+        val dm = DisplayMetrics(); @Suppress("DEPRECATION") wm.defaultDisplay.getRealMetrics(dm)
+        if (dm.widthPixels != W || dm.heightPixels != H) {
+            toast("หมุนจอแล้ว กรุณากดเริ่มใหม่อีกครั้ง"); stopSelf()
+        }
     }
 
     private fun startFg() {
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(NotificationChannel("m", "Manga Overlay", NotificationManager.IMPORTANCE_LOW))
+        val stopPi = PendingIntent.getService(this, 0,
+            Intent(this, OverlayService::class.java).setAction(ACTION_STOP), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val stopAct = Notification.Action.Builder(
+            Icon.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel), "หยุด", stopPi).build()
         val n = Notification.Builder(this, "m").setContentTitle("Manga Overlay").setContentText("กำลังทำงาน")
-            .setSmallIcon(android.R.drawable.ic_menu_edit).build()
+            .setSmallIcon(android.R.drawable.ic_menu_edit).addAction(stopAct).setOngoing(true).build()
         if (Build.VERSION.SDK_INT >= 29) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
         else startForeground(1, n)
     }
@@ -107,7 +138,7 @@ class OverlayService : Service() {
                     if (abs(e.rawX - dx) > 12 || abs(e.rawY - dy) > 12) moved = true
                     if (moved) { lp.x = sx + (e.rawX - dx).toInt(); lp.y = sy + (e.rawY - dy).toInt(); wm.updateViewLayout(btn, lp); updateMask() }
                 }
-                MotionEvent.ACTION_UP -> if (!moved) { if (e.eventTime - down > 700) stopSelf() else toggle() }
+                MotionEvent.ACTION_UP -> if (!moved) { if (e.eventTime - down > 700) { toast("ปิด Manga Overlay"); stopSelf() } else toggle() }
             }
             true
         }
@@ -129,7 +160,15 @@ class OverlayService : Service() {
     }
 
     private fun applyStep(s: Step) {
-        if (!active || container.childCount == 0) return
+        if (!active) return
+        if (container.childCount == 0) {
+            // หน้าแรกไม่พบข้อความ: พอเลื่อนไปหน้าที่มีข้อความแล้วหยุดนิ่ง ต้องสแกนใหม่เอง (เดิมค้างไม่ทำอะไรจนกว่าจะกดปุ่มใหม่)
+            if (!s.ok || abs(s.tx) > 2f || abs(s.ty) > 2f) {
+                settleJob?.cancel()
+                settleJob = scope.launch { delay(350); if (active && !busy && container.childCount == 0) full() }
+            }
+            return
+        }
         if (!s.ok) { lost = true; container.visibility = View.INVISIBLE }
         else if (!lost) {
             tx = s.s * tx + s.tx; ty = s.s * ty + s.ty; sc *= s.s; accDy += s.ty
@@ -258,8 +297,12 @@ class OverlayService : Service() {
     private fun toast(m: String) = Toast.makeText(this, m, Toast.LENGTH_SHORT).show()
 
     override fun onDestroy() {
+        stopping = true
         scope.cancel()
-        capture?.release(); proj?.stop()
+        Translator.close()
+        capture?.release(); capture = null
+        projCb?.let { cb -> runCatching { proj?.unregisterCallback(cb) } }
+        runCatching { proj?.stop() }; proj = null
         runCatching { wm.removeView(layer) }; runCatching { wm.removeView(btn) }
         super.onDestroy()
     }
