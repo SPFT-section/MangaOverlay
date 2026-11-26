@@ -14,6 +14,7 @@ import android.view.*
 import android.view.WindowManager.LayoutParams as WLP
 import android.widget.FrameLayout
 import android.widget.TextView
+import android.widget.Toast
 import androidx.core.widget.TextViewCompat
 import kotlinx.coroutines.*
 import org.opencv.android.OpenCVLoader
@@ -46,6 +47,8 @@ class OverlayService : Service() {
         if (i == null || capture != null) return START_NOT_STICKY
         startFg()
         OpenCVLoader.initLocal()
+        Translator.init(applicationContext)
+        Translator.onStatus = { m -> main.post { toast(m) } }
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         val dm = DisplayMetrics(); @Suppress("DEPRECATION") wm.defaultDisplay.getRealMetrics(dm)
         W = dm.widthPixels; H = dm.heightPixels
@@ -159,6 +162,7 @@ class OverlayService : Service() {
             lost = false; container.visibility = View.VISIBLE
             val items = Ocr.run(bmp, (H * 0.04f).toInt())
             bmp.recycle()
+            if (items.isEmpty()) toast("ไม่พบข้อความในหน้านี้")
             addItems(items, 1f, 0f, 0f)
         } finally { busy = false }
     }
@@ -242,6 +246,8 @@ class OverlayService : Service() {
         }
         updateMask()
     }
+
+    private fun toast(m: String) = Toast.makeText(this, m, Toast.LENGTH_SHORT).show()
 
     override fun onDestroy() {
         scope.cancel()
