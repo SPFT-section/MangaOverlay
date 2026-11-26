@@ -40,4 +40,26 @@ object Prefs {
     var glossary: String
         get() = if (::sp.isInitialized) sp.getString("glossary", "") ?: "" else ""
         set(v) { sp.edit().putString("glossary", v).apply() }
+
+    /** ปรับสำนวนคำแปลให้เป็นภาษาพูดแบบมังงะ (วลีสำเร็จรูป + ตัดคำสุภาพ/ทางการที่เครื่องแปลใส่เกิน) */
+    var mangaStyle: Boolean
+        get() = sp.getBoolean("mstyle", true)
+        set(v) { sp.edit().putBoolean("mstyle", v).apply() }
+
+    /** ตัวแปลด้วย AI (ไม่บังคับ): 0=ปิด 1=Gemini 2=OpenAI-compatible (Groq/OpenRouter/Ollama ฯลฯ) 3=Claude */
+    var llmProvider: Int
+        get() = sp.getInt("llm_p", 0).coerceIn(0, 3)
+        set(v) { sp.edit().putInt("llm_p", v.coerceIn(0, 3)).apply() }
+
+    var llmKey: String
+        get() = sp.getString("llm_k", "") ?: ""
+        set(v) { sp.edit().putString("llm_k", v.trim()).apply() }
+
+    var llmModel: String
+        get() = sp.getString("llm_m", "") ?: ""
+        set(v) { sp.edit().putString("llm_m", v.trim()).apply() }
+
+    var llmBase: String
+        get() = sp.getString("llm_b", "") ?: ""
+        set(v) { sp.edit().putString("llm_b", v.trim()).apply() }
 }

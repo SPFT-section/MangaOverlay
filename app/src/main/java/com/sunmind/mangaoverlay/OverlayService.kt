@@ -48,8 +48,12 @@ class OverlayService : Service() {
     private var W = 0; private var H = 0
     // transform ของ container (screen = sc*local + t)
     private var sc = 1f; private var tx = 0f; private var ty = 0f
-    private var scOcr = 1f; private var accDy = 0f
+    private var px = 0f; private var py = 0f          // ชดเชยความหน่วงของการจับภาพ (คาดการณ์ตามความเร็ว) ใช้เฉพาะตอนแสดงผล
+    private var epoch = 0
+    private val keeper = PoseKeeper()
+    private var statTotal = 0; private var statDone = 0; private var statAi = false
     private var active = false; private var busy = false; private var lost = false
+    private val restRun = Runnable { px = 0f; py = 0f; if (::container.isInitialized) applyTransform() }
     private var settleJob: Job? = null
     private var busyUi = false; private var peeking = false; private var rescanQ = false
     private var menu: LinearLayout? = null; private var menuLp: WLP? = null
@@ -97,8 +101,9 @@ class OverlayService : Service() {
             val cb = object : MediaProjection.Callback() { override fun onStop() { stopSelf() } }
             projCb = cb
             mp.registerCallback(cb, main)
-            capture = Capture(mp, W, H, dm.densityDpi).also { c ->
-                c.onGray = { g -> tracker.step(g, mask)?.let { s -> main.post { applyStep(s) } } }
+            capture = Capture(mp, W, H, dm.densityDpi, keeper).also { c ->
+                // รันบน thread ของ Capture: ตามการเลื่อน -> สะสมท่า (ครบทุกเฟรม) -> ส่งให้ UI วาด
+                c.onGray = { g, ts -> tracker.step(g, mask)?.let { s -> val d = keeper.update(s, ts); main.post { applyStep(d) } } }
             }
             buildLayer(); buildButton()
             running = true; notifyTile()
@@ -258,7 +263,7 @@ class OverlayService : Service() {
         if (!active) peeking = false
         applyAlpha(); refreshBtn(); haptic(); updateNotif()
         capture?.tracking = active
-        if (active) scope.launch { while (busy) delay(50); full() } else { container.removeAllViews(); updateMask() }
+        if (active) scope.launch { while (busy) delay(50); full() } else { container.removeAllViews(); px = 0f; py = 0f; updateMask() }
     }
 
     /** สแกนหน้าปัจจุบันใหม่ทันที (ถ้ายังไม่เปิดแปล จะเปิดให้) */
@@ -298,6 +303,7 @@ class OverlayService : Service() {
             setPadding(dp(6), dp(6), dp(6), dp(6))
             addView(item("↻  สแกนใหม่", Color.WHITE) { rescan() })
             addView(item(if (peeking) "◐  แสดงคำแปล" else "◐  ดูต้นฉบับ", Color.WHITE) { togglePeek() })
+            addView(item("✓  สถานะการแปล", Color.WHITE) { report() })
             addView(item("⚙  ตั้งค่า", Color.WHITE) { openApp() })
             addView(item("✕  ปิด Manga Overlay", 0xFFFCA5A5.toInt()) { toast("ปิด Manga Overlay"); stopSelf() })
             setOnTouchListener { _, e -> if (e.action == MotionEvent.ACTION_OUTSIDE) dismissMenu(); false }
@@ -309,7 +315,7 @@ class OverlayService : Service() {
             PixelFormat.TRANSLUCENT).apply { gravity = Gravity.TOP or Gravity.START }
         val onRight = bl.x + bl.width / 2 > W / 2
         lp.x = if (onRight) bl.x - w - dp(8) else bl.x + bl.width + dp(8)
-        val estH = dp(4 * 42 + 12)
+        val estH = dp(5 * 42 + 12)
         lp.y = bl.y.coerceIn(dp(24), max(dp(24), H - estH - dp(24)))
         try { wm.addView(box, lp) } catch (e: Exception) { return }
         menu = box; menuLp = lp
@@ -325,26 +331,32 @@ class OverlayService : Service() {
 
     // ---------- tracking ----------
     private fun applyTransform() {
-        container.scaleX = sc; container.scaleY = sc; container.translationX = tx; container.translationY = ty
+        container.scaleX = sc; container.scaleY = sc; container.translationX = tx + px; container.translationY = ty + py
         updateMask()
     }
 
-    private fun applyStep(s: Step) {
-        if (!active) return
+    private fun applyStep(d: Disp) {
+        if (!active || d.pose.epoch != epoch) return   // ผลที่ตกค้างจากก่อนสแกนใหม่ ทิ้งไป
+        val p = d.pose
+        sc = p.s; tx = p.tx; ty = p.ty
+        // ชดเชยความหน่วง ~2-3 เฟรมระหว่างจับภาพ->คำนวณ->วาด ด้วยการคาดการณ์ตามความเร็วล่าสุด (จำกัดไม่ให้เกินจริง)
+        val lead = 30f
+        px = (d.vx * lead).coerceIn(-45f, 45f); py = (d.vy * lead).coerceIn(-45f, 45f)
+        if (!d.ok || d.still || abs(px) < 0.5f && abs(py) < 0.5f) { px = 0f; py = 0f }
+        main.removeCallbacks(restRun); main.postDelayed(restRun, 90)   // หยุดเลื่อน = คืนตำแหน่งจริง ไม่ค้างค่าคาดการณ์
         if (container.childCount == 0) {
-            // หน้าแรกไม่พบข้อความ: พอเลื่อนไปหน้าที่มีข้อความแล้วหยุดนิ่ง ต้องสแกนใหม่เอง (เดิมค้างไม่ทำอะไรจนกว่าจะกดปุ่มใหม่)
-            if (!s.ok || abs(s.tx) > 2f || abs(s.ty) > 2f) {
+            // หน้าแรกไม่พบข้อความ: พอเลื่อนไปหน้าที่มีข้อความแล้วหยุดนิ่ง ต้องสแกนใหม่เอง
+            if (d.moved) {
                 settleJob?.cancel()
                 settleJob = scope.launch { delay(350); if (active && !busy && container.childCount == 0) full() }
             }
             return
         }
-        if (!s.ok) { lost = true; container.visibility = View.INVISIBLE }
-        else if (!lost) {
-            tx = s.s * tx + s.tx; ty = s.s * ty + s.ty; sc *= s.s; accDy += s.ty
-            applyTransform()
-            if (!busy && abs(accDy) > H * 0.25f && abs(sc / scOcr - 1f) <= 0.03f) scope.launch { strip() }
-        }
+        // ตามไม่ได้ชั่วคราวไม่ซ่อนกรอบ (เดิมซ่อนทันทีแล้วสแกนใหม่ทั้งหน้า = กระพริบ) จะซ่อนก็ต่อเมื่อหลงตำแหน่งจริง
+        if (d.lost) { lost = true; container.visibility = View.INVISIBLE }
+        else if (container.visibility != View.VISIBLE && !lost) container.visibility = View.VISIBLE
+        applyTransform()
+        if (!lost && !busy && abs(p.acc) > H * 0.25f && abs(sc - 1f) <= 0.03f) scope.launch { strip() }
         settleJob?.cancel()
         settleJob = scope.launch { delay(150); scope.launch { onSettle() } }
     }
@@ -369,22 +381,25 @@ class OverlayService : Service() {
         try {
             val hide = container.visibility == View.VISIBLE && container.childCount > 0
             container.removeAllViews()
-            sc = 1f; tx = 0f; ty = 0f; scOcr = 1f; accDy = 0f
-            applyTransform(); tracker.reset()
-            val bmp = capture!!.snapshot(if (hide) listOf(container) else emptyList(), hide)
+            tracker.reset()
+            // ตั้งต้นท่าที่เฟรมของภาพที่จะ OCR พอดี: ถ้าผู้ใช้เลื่อนหน้าระหว่างรอ OCR/แปล กรอบจะเลื่อนตามไปถูกที่ ไม่เพี้ยน
+            val snap = capture!!.snapshot(if (hide) listOf(container) else emptyList(), hide, resetPose = true)
+            epoch = snap.pose.epoch; sc = 1f; tx = 0f; ty = 0f; px = 0f; py = 0f
             lost = false; container.visibility = View.VISIBLE
+            applyTransform()
+            val bmp = snap.bmp
             val found = Ocr.run(bmp, scope, (H * 0.04f).toInt())
             bmp.recycle()
             if (found.items.isEmpty()) toast("ไม่พบข้อความในหน้านี้")
-            addItems(found.items, found.tr, 1f, 0f, 0f)
+            addItems(found, 1f, 0f, 0f, true)
         } finally { busy = false; ui(false) }
     }
 
     private suspend fun onSettle() {
         if (!active) return
         if (busy) { settleJob = scope.launch { delay(250); onSettle() }; return }
-        if (lost || abs(sc / scOcr - 1f) > 0.03f) { full(); return }
-        if (abs(accDy) >= H * 0.06f) strip() else prune()
+        if (lost || abs(sc - 1f) > 0.03f) { full(); return }
+        if (abs(keeper.now().acc) >= H * 0.06f) strip() else prune()
     }
 
     /** OCR เฉพาะแถบใหม่ที่เลื่อนเข้ามา (ไม่ซ่อนโอเวอร์เลย์ เพราะแถบใหม่ยังไม่มีข้อความทับ) */
@@ -392,24 +407,28 @@ class OverlayService : Service() {
         if (busy || !active) return
         busy = true; ui(true)
         try {
-            val moved = accDy
+            val snap = capture!!.snapshot(emptyList(), false)
+            val ps = snap.pose
+            if (ps.epoch != epoch) { snap.bmp.recycle(); return }
+            val moved = ps.acc                       // ระยะเลื่อนสะสม ณ เฟรมของภาพนี้พอดี
             val margin = (H * 0.1f).toInt()
             val y0: Int; val y1: Int
             if (moved < 0) { y0 = max(0, H + moved.toInt() - margin); y1 = H } else { y0 = 0; y1 = min(H, moved.toInt() + margin) }
-            val bmp = capture!!.snapshot(emptyList(), false)
-            val s0 = sc; val x0 = tx; val yy0 = ty
-            val crop = Bitmap.createBitmap(bmp, 0, y0, W, y1 - y0)
+            if (y1 - y0 < 48) { snap.bmp.recycle(); return }
+            val crop = Bitmap.createBitmap(snap.bmp, 0, y0, W, y1 - y0)
             val found = Ocr.run(crop, scope)
-            crop.recycle(); bmp.recycle()
+            crop.recycle(); snap.bmp.recycle()
             found.items.forEach { it.r.offset(0, y0) }
-            accDy -= moved
-            addItems(found.items.filter { it.r.top >= H * 0.04f }, found.tr, s0, x0, yy0)
+            keeper.subAcc(moved)
+            addItems(Found(found.items.filter { it.r.top >= H * 0.04f }, found.tr, found.better), ps.s, ps.tx, ps.ty, false)
             prune()
         } finally { busy = false; ui(false) }
     }
 
     /** items อยู่ในพิกัดหน้าจอ ณ เวลา snapshot (s0,x0,y0) -> แปลงเป็น local; วางกรอบทันที แล้วเติมข้อความไทยเมื่อแปลเสร็จ */
-    private suspend fun addItems(items: List<Item>, tr: Deferred<Map<String, String?>>, s0: Float, x0: Float, y0: Float) {
+    private suspend fun addItems(f: Found, s0: Float, x0: Float, y0: Float, whole: Boolean) {
+        val items = f.items
+        if (whole) { statTotal = 0; statDone = 0; statAi = false }
         if (!active || items.isEmpty()) return
         val views = ArrayList<Pair<TextView, Item>>()
         for (item in items) {
@@ -432,17 +451,50 @@ class OverlayService : Service() {
             }
             if (skip) continue
             val tv = makeTv(item.bg)
+            tv.visibility = View.INVISIBLE   // ยังไม่มีคำแปล: ไม่ให้กล่องเปล่าบังต้นฉบับ
             container.addView(tv, FrameLayout.LayoutParams(w.toInt(), h.toInt()).apply { leftMargin = l.toInt(); topMargin = t.toInt() })
             views.add(Pair(tv, item))
         }
         updateMask()
+        statTotal += views.size
         // คำแปลเริ่มทำงานตั้งแต่ตอนหากรอบ ส่วนใหญ่จึงเสร็จแล้ว/ใกล้เสร็จตอนมาถึงตรงนี้
-        val th = try { tr.await() } catch (e: CancellationException) { throw e } catch (e: Exception) { emptyMap<String, String?>() }
+        val th = try { f.tr.await() } catch (e: CancellationException) { throw e } catch (e: Exception) { emptyMap<String, String?>() }
+        val missing = ArrayList<Pair<TextView, Item>>()
         for ((tv, item) in views) {
             val t = th[item.text]
-            if (t.isNullOrBlank()) container.removeView(tv) else tv.text = t // แปลไม่ได้ -> เอากรอบออก ให้เห็นต้นฉบับ
+            if (t.isNullOrBlank()) missing.add(Pair(tv, item)) else { tv.text = t; tv.visibility = View.VISIBLE; statDone++ }
         }
         updateMask()
+        // งานที่ไม่ควรค้าง busy: ลองกรอบที่แปลไม่ได้ซ้ำ + รอคำแปลจาก AI (ช้ากว่าแต่ดีกว่า) แล้วแทนที่
+        scope.launch {
+            if (missing.isNotEmpty()) {
+                delay(1200)
+                val again = Translator.translate(missing.map { it.second.text }.distinct(), strict = false, force = true)
+                val map = missing.map { it.second.text }.distinct().zip(again).toMap()
+                for ((tv, item) in missing) {
+                    val t = map[item.text]
+                    if (!t.isNullOrBlank() && tv.parent === container) { tv.text = t; tv.visibility = View.VISIBLE; statDone++ }
+                }
+            }
+            val bm = f.better?.let { try { it.await() } catch (e: CancellationException) { throw e } catch (e: Exception) { null } }
+            if (bm != null && bm.isNotEmpty()) {
+                statAi = true
+                for ((tv, item) in views) {
+                    val t = bm[item.text] ?: continue
+                    if (tv.parent !== container) continue
+                    if (tv.visibility != View.VISIBLE) statDone++
+                    tv.text = t; tv.visibility = View.VISIBLE
+                }
+            }
+            // ยังไม่มีคำแปลจริง ๆ -> เอากรอบออกให้เห็นต้นฉบับ
+            for ((tv, _) in views) if (tv.parent === container && tv.visibility != View.VISIBLE) container.removeView(tv)
+            updateMask()
+        }
+    }
+
+    private fun report() {
+        val pct = if (statTotal == 0) 0 else statDone * 100 / statTotal
+        toast("แปลแล้ว $statDone/$statTotal กรอบ ($pct%) • ตัวแปล: ${if (statAi) "AI + " else ""}${Translator.engine().ifEmpty { "-" }}")
     }
 
     private fun makeTv(bg: Int) = TextView(this).apply {

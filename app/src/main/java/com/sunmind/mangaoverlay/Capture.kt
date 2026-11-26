@@ -15,9 +15,12 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
-const val Q = 4 // tracking downscale factor
+const val Q = 3 // tracking downscale factor (ละเอียดขึ้นจาก 4 -> ตำแหน่งแม่นขึ้น)
 
-class Capture(proj: MediaProjection, val w: Int, val h: Int, dpi: Int) {
+/** ภาพเต็มความละเอียด + ท่าของหน้า ณ เฟรมนั้นพอดี */
+class Snap(val bmp: Bitmap, val pose: Pose)
+
+class Capture(proj: MediaProjection, val w: Int, val h: Int, dpi: Int, private val keeper: PoseKeeper) {
     private val ht = HandlerThread("cap").apply { start() }
     private val handler = Handler(ht.looper)
     private val reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 3)
@@ -25,25 +28,35 @@ class Capture(proj: MediaProjection, val w: Int, val h: Int, dpi: Int) {
     private val vd: VirtualDisplay
     @Volatile var frames = 0
     @Volatile var tracking = false
-    @Volatile var onGray: ((ByteArray) -> Unit)? = null
+    /** เรียกบน thread ของ Capture ทุกเฟรมที่เปิดการติดตาม: (ภาพเทาย่อ, เวลาเฟรมเป็น ns) */
+    @Volatile var onGray: ((ByteArray, Long) -> Unit)? = null
 
     init {
         reader.setOnImageAvailableListener({ r ->
             val img = r.acquireLatestImage() ?: return@setOnImageAvailableListener
             held?.close(); held = img; frames++
-            if (tracking) runCatching { onGray?.invoke(gray(img)) }
+            if (tracking) runCatching { onGray?.invoke(gray(img), img.timestamp) }
         }, handler)
         vd = proj.createVirtualDisplay("manga", w, h, dpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader.surface, null, handler)
     }
 
+    /** ย่อภาพเป็นเทาโดยเฉลี่ย 2x2 ต่อจุด (เดิมสุ่มจุดเดียว ทำให้เกิด aliasing บนตัวหนังสือ/ลายสกรีน) */
     private fun gray(img: Image): ByteArray {
         val p = img.planes[0]; val b = p.buffer; val rs = p.rowStride; val ps = p.pixelStride
         val sw = w / Q; val sh = h / Q; val out = ByteArray(sw * sh)
+        val last = b.limit() - 1
         for (y in 0 until sh) {
-            val row = y * Q * rs
+            val r0 = y * Q * rs
+            val r1 = r0 + (if (Q > 1) rs else 0)
             for (x in 0 until sw) {
-                val i = row + x * Q * ps
-                out[y * sw + x] = (((b.get(i).toInt() and 255) * 77 + (b.get(i + 1).toInt() and 255) * 150 + (b.get(i + 2).toInt() and 255) * 29) shr 8).toByte()
+                val i0 = r0 + x * Q * ps; val i1 = r1 + x * Q * ps
+                var sum = 0
+                for (k in 0..3) {
+                    val i = (if (k < 2) i0 else i1) + (k and 1) * ps
+                    if (i + 2 > last) continue
+                    sum += ((b.get(i).toInt() and 255) * 77 + (b.get(i + 1).toInt() and 255) * 150 + (b.get(i + 2).toInt() and 255) * 29) shr 8
+                }
+                out[y * sw + x] = (sum shr 2).toByte()
             }
         }
         return out
@@ -60,8 +73,11 @@ class Capture(proj: MediaProjection, val w: Int, val h: Int, dpi: Int) {
         return cropped
     }
 
-    /** Hides our own overlay views, waits for a clean frame, returns full-res bitmap. */
-    suspend fun snapshot(hide: List<View>, wait: Boolean): Bitmap {
+    /**
+     * ซ่อนโอเวอร์เลย์ของเราเอง รอเฟรมที่สะอาด แล้วคืนภาพเต็ม + ท่าของหน้า ณ เฟรมนั้น
+     * resetPose=true: ตั้งต้นท่าเป็นศูนย์ที่เฟรมนี้พอดี (ใช้ตอนสแกนทั้งหน้า) การเลื่อนหลังจากนี้จึงนับต่อจากภาพที่ OCR
+     */
+    suspend fun snapshot(hide: List<View>, wait: Boolean, resetPose: Boolean = false): Snap {
         val f0 = frames
         hide.forEach { it.visibility = View.INVISIBLE }
         try {
@@ -71,8 +87,12 @@ class Capture(proj: MediaProjection, val w: Int, val h: Int, dpi: Int) {
             if (wait) { t = 0; while (frames == f0 && t < 250) { delay(16); t += 16 }; delay(32) }
             return suspendCancellableCoroutine { c ->
                 handler.post {
-                    try { c.resume(toBitmap(held ?: throw IllegalStateException("no frame"))) }
-                    catch (e: Throwable) { c.resumeWithException(e) }
+                    try {
+                        val img = held ?: throw IllegalStateException("no frame")
+                        // ทั้งสองอย่างรันบน handler เดียวกับ listener ของเฟรม จึงสอดคล้องกับ held พอดี
+                        val pose = if (resetPose) keeper.reset() else keeper.now()
+                        c.resume(Snap(toBitmap(img), pose))
+                    } catch (e: Throwable) { c.resumeWithException(e) }
                 }
             }
         } finally {

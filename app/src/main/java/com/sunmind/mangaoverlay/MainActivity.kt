@@ -52,6 +52,12 @@ class MainActivity : Activity() {
     private lateinit var tvPerm: TextView
     private lateinit var tvRun: TextView
     private lateinit var startBtn: TextView
+    private lateinit var llmKeyBox: EditText
+    private lateinit var llmModelBox: EditText
+    private lateinit var llmBaseBox: EditText
+    private lateinit var llmOut: TextView
+    private lateinit var provChips: List<TextView>
+    private val provNames = listOf("ปิด", "Gemini", "OpenAI-compat", "Claude")
 
     // ---------- ตัวช่วยสร้าง UI ----------
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
@@ -152,6 +158,16 @@ class MainActivity : Activity() {
             }
         })
         out = tv("", 16f, TXT).apply { setPadding(0, dp(12), 0, 0); setTextIsSelectable(true) }
+        llmKeyBox = field(EditText(this).apply {
+            hint = "API key"; setSingleLine(); setText(Prefs.llmKey)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        })
+        llmModelBox = field(EditText(this).apply { setSingleLine(); setText(Prefs.llmModel) })
+        llmBaseBox = field(EditText(this).apply {
+            hint = "Base URL เช่น https://api.groq.com/openai/v1"; setSingleLine(); setText(Prefs.llmBase)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+        })
+        llmOut = tv("", 13f, TXT).apply { setPadding(0, dp(8), 0, 0); setTextIsSelectable(true) }
 
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -171,6 +187,8 @@ class MainActivity : Activity() {
             addView(line(), LinearLayout.LayoutParams(-1, 1))
             addView(toggleRow("ขยายกล่องให้พอดีกรอบ", "กล่องคำแปลคลุมกรอบคำพูดทั้งกรอบ", Prefs.fit) { Prefs.fit = it })
             addView(line(), LinearLayout.LayoutParams(-1, 1))
+            addView(toggleRow("สำนวนมังงะ", "วลีสั้น/คำอุทาน/เสียงประกอบแปลแบบมังงะ และตัดคำสุภาพที่เครื่องแปลใส่เกิน", Prefs.mangaStyle) { Prefs.mangaStyle = it })
+            addView(line(), LinearLayout.LayoutParams(-1, 1))
             addView(toggleRow("ตัวอักษรหนา", "อ่านง่ายขึ้นบนกรอบสีอ่อน", Prefs.bold) { Prefs.bold = it })
             addView(line(), LinearLayout.LayoutParams(-1, 1))
             addView(toggleRow("สั่นเมื่อแตะปุ่มลอย", "ให้ฟีดแบ็กตอนแตะ แตะสองครั้ง และกดค้าง", Prefs.haptic) { Prefs.haptic = it })
@@ -181,6 +199,25 @@ class MainActivity : Activity() {
         val glossary = card {
             addView(section("ศัพท์เฉพาะ / ชื่อตัวละคร"))
             addView(gl)
+        }
+
+        val chips = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        provChips = provNames.mapIndexed { i, n ->
+            TextView(this).apply {
+                text = n; textSize = 13f; setTextColor(Color.WHITE); gravity = Gravity.CENTER; isClickable = true
+                setPadding(dp(6), dp(10), dp(6), dp(10))
+                setOnClickListener { Prefs.llmProvider = i; refreshProv() }
+            }.also { chips.addView(it, LinearLayout.LayoutParams(0, -2, 1f).apply { if (i > 0) leftMargin = dp(6) }) }
+        }
+        val ai = card {
+            addView(section("แปลด้วย AI (ไม่บังคับ — แม่นและได้สำนวนมังงะที่สุด)"))
+            addView(tv("ใส่ API key ของคุณเอง เช่น Gemini ฟรีจาก aistudio.google.com/apikey ถ้าไม่ใส่ แอปใช้ Google / Bing / ออฟไลน์ตามปกติ AI จะแปลทั้งหน้าพร้อมบริบท แล้วแทนที่คำแปลเร็วเมื่อเสร็จ", 12f, SUB).apply { setLineSpacing(0f, 1.15f) })
+            addView(chips, lp(10))
+            addView(llmKeyBox, lp(10))
+            addView(llmModelBox, lp(8))
+            addView(llmBaseBox, lp(8))
+            addView(button("ทดสอบการเชื่อมต่อ", 0xFF374151.toInt()) { testLlm() }, lp(10))
+            addView(llmOut)
         }
 
         dictCard = card {
@@ -208,11 +245,12 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(20), dp(16), dp(28))
             addView(header)
-            addView(status, lp(20)); addView(display, lp(12)); addView(glossary, lp(12))
+            addView(status, lp(20)); addView(display, lp(12)); addView(ai, lp(12)); addView(glossary, lp(12))
             addView(dictCard, lp(12)); addView(tips, lp(12))
         }
         scroll = ScrollView(this).apply { setBackgroundColor(BG); isFillViewport = true; addView(root) }
         setContentView(scroll)
+        refreshProv()
         if (b == null) handle(intent)
     }
 
@@ -245,7 +283,27 @@ class MainActivity : Activity() {
         startBtn.background = ripple(if (run) RED else ACCENT_D, 14)
     }
 
-    private fun save() { Prefs.glossary = gl.text.toString() }
+    private fun save() {
+        Prefs.glossary = gl.text.toString()
+        Prefs.llmKey = llmKeyBox.text.toString(); Prefs.llmModel = llmModelBox.text.toString(); Prefs.llmBase = llmBaseBox.text.toString()
+    }
+
+    private fun refreshProv() {
+        val p = Prefs.llmProvider
+        provChips.forEachIndexed { i, t -> t.background = shape(if (i == p) ACCENT_D else 0xFF10131A.toInt(), 10, LINE) }
+        llmKeyBox.visibility = if (p == 0) View.GONE else View.VISIBLE
+        llmModelBox.visibility = if (p == 0) View.GONE else View.VISIBLE
+        llmBaseBox.visibility = if (p == 2) View.VISIBLE else View.GONE
+        llmModelBox.hint = "ชื่อโมเดล (เว้นว่าง = ${Llm.defaultModel(p)})"
+    }
+
+    private fun testLlm() {
+        save(); llmOut.text = "กำลังทดสอบ..."
+        Thread {
+            val r = try { Llm.test() } catch (e: Exception) { "ไม่สำเร็จ: ${e.javaClass.simpleName}" }
+            runOnUiThread { if (!isDestroyed) llmOut.text = r }
+        }.start()
+    }
 
     override fun onPause() { save(); super.onPause() }
 
@@ -263,7 +321,7 @@ class MainActivity : Activity() {
                 } else {
                     Translator.init(app)
                     // Google -> ML Kit ออฟไลน์ -> พจนานุกรม (ตามลำดับเดียวกับโอเวอร์เลย์)
-                    runBlocking { Translator.translate(listOf(q)) }.firstOrNull() ?: "แปลไม่ได้"
+                    runBlocking { Translator.translate(listOf(q), strict = false) }.firstOrNull() ?: "แปลไม่ได้"
                 }
             } catch (e: Exception) { "เกิดข้อผิดพลาด: ${e.javaClass.simpleName}" }
             runOnUiThread { if (!isDestroyed) out.text = r }
