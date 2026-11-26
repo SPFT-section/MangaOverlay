@@ -31,7 +31,7 @@ class OverlayService : Service() {
     private var capture: Capture? = null
     private lateinit var tracker: Tracker
     private val main = Handler(Looper.getMainLooper())
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main + CoroutineExceptionHandler { _, _ -> busy = false })
     private var W = 0; private var H = 0
     // transform ของ container (screen = sc*local + t)
     private var sc = 1f; private var tx = 0f; private var ty = 0f
@@ -58,6 +58,7 @@ class OverlayService : Service() {
             c.onGray = { g -> tracker.step(g, mask)?.let { s -> main.post { applyStep(s) } } }
         }
         buildLayer(); buildButton()
+        scope.launch { Translator.warmUp() }
         return START_NOT_STICKY
     }
 
@@ -113,7 +114,7 @@ class OverlayService : Service() {
         active = !active
         (btn.background as GradientDrawable).setColor(if (active) 0xCC1B9E4B.toInt() else 0xCC555555.toInt())
         capture?.tracking = active
-        if (active) scope.launch { full() } else { container.removeAllViews(); updateMask() }
+        if (active) scope.launch { while (busy) delay(50); full() } else { container.removeAllViews(); updateMask() }
     }
 
     // ---------- tracking ----------
@@ -128,9 +129,10 @@ class OverlayService : Service() {
         else if (!lost) {
             tx = s.s * tx + s.tx; ty = s.s * ty + s.ty; sc *= s.s; accDy += s.ty
             applyTransform()
+            if (!busy && abs(accDy) > H * 0.25f && abs(sc / scOcr - 1f) <= 0.03f) scope.launch { strip() }
         }
         settleJob?.cancel()
-        settleJob = scope.launch { delay(250); scope.launch { onSettle() } }
+        settleJob = scope.launch { delay(150); scope.launch { onSettle() } }
     }
 
     private fun updateMask() {
@@ -149,43 +151,52 @@ class OverlayService : Service() {
         if (busy) return
         busy = true
         try {
-            val had = container.childCount > 0
+            val hide = container.visibility == View.VISIBLE && container.childCount > 0
             container.removeAllViews()
-            sc = 1f; tx = 0f; ty = 0f; scOcr = 1f; accDy = 0f; lost = false
+            sc = 1f; tx = 0f; ty = 0f; scOcr = 1f; accDy = 0f
             applyTransform(); tracker.reset()
-            val bmp = capture!!.snapshot(listOf(layer, btn), had)
-            val items = Ocr.run(bmp)
-            container.visibility = View.VISIBLE
+            val bmp = capture!!.snapshot(if (hide) listOf(container) else emptyList(), hide)
+            lost = false; container.visibility = View.VISIBLE
+            val items = Ocr.run(bmp, (H * 0.04f).toInt())
+            bmp.recycle()
             addItems(items, 1f, 0f, 0f)
         } finally { busy = false }
     }
 
     private suspend fun onSettle() {
         if (!active) return
-        if (busy) { settleJob = scope.launch { delay(300); onSettle() }; return }
+        if (busy) { settleJob = scope.launch { delay(250); onSettle() }; return }
         if (lost || abs(sc / scOcr - 1f) > 0.03f) { full(); return }
-        val moved = accDy
-        if (abs(moved) < H * 0.12f) { prune(); return }
+        if (abs(accDy) >= H * 0.06f) strip() else prune()
+    }
+
+    /** OCR เฉพาะแถบใหม่ที่เลื่อนเข้ามา (ไม่ซ่อนโอเวอร์เลย์ เพราะแถบใหม่ยังไม่มีข้อความทับ) */
+    private suspend fun strip() {
+        if (busy || !active) return
         busy = true
         try {
+            val moved = accDy
             val margin = (H * 0.1f).toInt()
             val y0: Int; val y1: Int
             if (moved < 0) { y0 = max(0, H + moved.toInt() - margin); y1 = H } else { y0 = 0; y1 = min(H, moved.toInt() + margin) }
-            val bmp = capture!!.snapshot(listOf(layer, btn), true)
+            val bmp = capture!!.snapshot(emptyList(), false)
             val s0 = sc; val x0 = tx; val yy0 = ty
             val crop = Bitmap.createBitmap(bmp, 0, y0, W, y1 - y0)
-            val items = Ocr.run(crop).map { (r, t) -> Pair(Rect(r).apply { offset(0, y0) }, t) }
-            accDy = 0f
-            addItems(items, s0, x0, yy0)
+            val items = Ocr.run(crop)
+            crop.recycle(); bmp.recycle()
+            items.forEach { it.r.offset(0, y0) }
+            accDy -= moved
+            addItems(items.filter { it.r.top >= H * 0.04f }, s0, x0, yy0)
             prune()
         } finally { busy = false }
     }
 
-    /** items อยู่ในพิกัดหน้าจอ ณ เวลา snapshot (s0,x0,y0) -> แปลงเป็นพิกัด local ก่อนวาง */
-    private suspend fun addItems(items: List<Pair<Rect, String>>, s0: Float, x0: Float, y0: Float) {
-        if (items.isEmpty()) return
-        val th = Translator.translate(items.map { it.second })
-        items.forEachIndexed { i, (r, _) ->
+    /** items อยู่ในพิกัดหน้าจอ ณ เวลา snapshot (s0,x0,y0) -> แปลงเป็น local; วางกรอบทันที แล้วเติมข้อความไทยเมื่อแปลเสร็จ */
+    private suspend fun addItems(items: List<Item>, s0: Float, x0: Float, y0: Float) {
+        if (!active || items.isEmpty()) return
+        val views = ArrayList<Pair<TextView, Item>>()
+        for (item in items.take(40)) {
+            val r = item.r
             val l = (r.left - 6 - x0) / s0; val t = (r.top - 6 - y0) / s0
             val w = (r.width() + 12) / s0; val h = (r.height() + 12) / s0
             val nr = RectF(l, t, l + w, t + h)
@@ -201,18 +212,26 @@ class OverlayService : Service() {
                     }
                 }
             }
-            if (skip) return@forEachIndexed
-            container.addView(makeTv(th[i]), FrameLayout.LayoutParams(w.toInt(), h.toInt()).apply {
-                leftMargin = l.toInt(); topMargin = t.toInt()
-            })
+            if (skip) continue
+            val tv = makeTv(item.bg)
+            container.addView(tv, FrameLayout.LayoutParams(w.toInt(), h.toInt()).apply { leftMargin = l.toInt(); topMargin = t.toInt() })
+            views.add(Pair(tv, item))
+        }
+        updateMask()
+        val th = Translator.translate(views.map { it.second.text })
+        views.forEachIndexed { i, (tv, _) ->
+            val s = th[i]
+            if (s == null) container.removeView(tv) else tv.text = s // แปลไม่ได้ -> เอากรอบออก ให้เห็นต้นฉบับ
         }
         updateMask()
     }
 
-    private fun makeTv(s: String) = TextView(this).apply {
-        text = s; setTextColor(Color.BLACK); gravity = Gravity.CENTER
-        setBackgroundColor(0xF5FFFFFF.toInt()); setPadding(4, 2, 4, 2)
-        TextViewCompat.setAutoSizeTextTypeUniformWithConfiguration(this, 8, 26, 1, TypedValue.COMPLEX_UNIT_SP)
+    private fun makeTv(bg: Int) = TextView(this).apply {
+        gravity = Gravity.CENTER; setPadding(4, 2, 4, 2)
+        val lum = 0.299 * Color.red(bg) + 0.587 * Color.green(bg) + 0.114 * Color.blue(bg)
+        setTextColor(if (lum > 140) Color.BLACK else Color.WHITE)
+        background = GradientDrawable().apply { setColor(Color.argb(0xF5, Color.red(bg), Color.green(bg), Color.blue(bg))); cornerRadius = 10f }
+        TextViewCompat.setAutoSizeTextTypeUniformWithConfiguration(this, 8, 26, 2, TypedValue.COMPLEX_UNIT_SP)
     }
 
     private fun prune() {

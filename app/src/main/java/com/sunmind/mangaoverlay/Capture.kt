@@ -31,7 +31,7 @@ class Capture(proj: MediaProjection, val w: Int, val h: Int, dpi: Int) {
         reader.setOnImageAvailableListener({ r ->
             val img = r.acquireLatestImage() ?: return@setOnImageAvailableListener
             held?.close(); held = img; frames++
-            if (tracking) onGray?.invoke(gray(img))
+            if (tracking) runCatching { onGray?.invoke(gray(img)) }
         }, handler)
         vd = proj.createVirtualDisplay("manga", w, h, dpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader.surface, null, handler)
     }
