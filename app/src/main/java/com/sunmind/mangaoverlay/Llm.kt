@@ -12,6 +12,7 @@ import java.net.URL
 object Llm {
     const val GEMINI = 1; const val OPENAI = 2; const val CLAUDE = 3
     @Volatile var lastErr = ""
+    @Volatile private var thinkOff = true   // ส่ง thinkingBudget=0 ให้ Gemini (ถอยกลับอัตโนมัติถ้าโมเดลปฏิเสธ)
     private val recent = ArrayDeque<String>()   // บรรทัดอังกฤษล่าสุด ใช้เป็นบริบทต่อเนื่องข้ามหน้า
 
     fun enabled() = Prefs.llmProvider != 0 && Prefs.llmKey.isNotBlank()
@@ -80,11 +81,23 @@ object Llm {
         val model = Prefs.llmModel.ifBlank { defaultModel(p) }
         return when (p) {
             GEMINI -> {
-                val body = JSONObject()
-                    .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", SYS))))
-                    .put("contents", JSONArray().put(JSONObject().put("role", "user").put("parts", JSONArray().put(JSONObject().put("text", user)))))
-                    .put("generationConfig", JSONObject().put("temperature", 0.3).put("responseMimeType", "application/json"))
-                val r = JSONObject(post("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent", mapOf("x-goog-api-key" to key), body))
+                fun body(noThink: Boolean): JSONObject {
+                    val gc = JSONObject().put("temperature", 0.3).put("responseMimeType", "application/json")
+                    // โมเดลตระกูล 2.5+ "คิด" ก่อนตอบโดยปริยาย ซึ่งช้าลงหลายวินาทีและไม่ช่วยงานแปลบรรทัดสั้น ๆ -> ปิด
+                    if (noThink) gc.put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
+                    return JSONObject()
+                        .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", SYS))))
+                        .put("contents", JSONArray().put(JSONObject().put("role", "user").put("parts", JSONArray().put(JSONObject().put("text", user)))))
+                        .put("generationConfig", gc)
+                }
+                val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent"
+                val hdr = mapOf("x-goog-api-key" to key)
+                val raw = try { post(url, hdr, body(thinkOff)) }
+                    catch (e: RuntimeException) {
+                        // บางโมเดลปิด thinking ไม่ได้ (HTTP 400): จำไว้แล้วลองใหม่แบบไม่ส่งค่านี้ ผู้ใช้ไม่เสียฟีเจอร์
+                        if (thinkOff && e.message?.startsWith("HTTP 400") == true) { thinkOff = false; post(url, hdr, body(false)) } else throw e
+                    }
+                val r = JSONObject(raw)
                 val parts = r.getJSONArray("candidates").getJSONObject(0).getJSONObject("content").getJSONArray("parts")
                 buildString { for (i in 0 until parts.length()) append(parts.getJSONObject(i).optString("text")) }
             }

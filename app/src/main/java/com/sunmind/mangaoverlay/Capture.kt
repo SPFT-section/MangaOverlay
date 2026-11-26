@@ -16,6 +16,8 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 const val Q = 3 // tracking downscale factor (ละเอียดขึ้นจาก 4 -> ตำแหน่งแม่นขึ้น)
+private const val GAP_MOVE = 14_000_000L   // ns: ช่วงห่างขั้นต่ำระหว่างเฟรมที่ประมวลผลตอนกำลังเลื่อน
+private const val GAP_IDLE = 30_000_000L   // ns: ตอนหน้าจอนิ่ง
 
 /** ภาพเต็มความละเอียด + ท่าของหน้า ณ เฟรมนั้นพอดี */
 class Snap(val bmp: Bitmap, val pose: Pose)
@@ -28,6 +30,14 @@ class Capture(proj: MediaProjection, val w: Int, val h: Int, dpi: Int, private v
     private val vd: VirtualDisplay
     @Volatile var frames = 0
     @Volatile var tracking = false
+    /** หน้าจอนิ่งอยู่ (ตั้งจากผลการตามล่าสุด): ลดอัตราการตามเหลือ ~30 fps เพื่อลดภาระ CPU/แบตตอนผู้ใช้กำลังอ่าน */
+    @Volatile var idle = false
+    private var lastProc = 0L
+    private val sw = w / Q
+    private val sh = h / Q
+    private val grayBuf = ByteArray(sw * sh)   // ใช้ซ้ำทุกเฟรม: Tracker.step() คัดลอกเข้า Mat ทันทีบน thread เดียวกัน
+    private var row0 = ByteArray(0)
+    private var row1 = ByteArray(0)
     /** เรียกบน thread ของ Capture ทุกเฟรมที่เปิดการติดตาม: (ภาพเทาย่อ, เวลาเฟรมเป็น ns) */
     @Volatile var onGray: ((ByteArray, Long) -> Unit)? = null
 
@@ -35,28 +45,45 @@ class Capture(proj: MediaProjection, val w: Int, val h: Int, dpi: Int, private v
         reader.setOnImageAvailableListener({ r ->
             val img = r.acquireLatestImage() ?: return@setOnImageAvailableListener
             held?.close(); held = img; frames++
-            if (tracking) runCatching { onGray?.invoke(gray(img), img.timestamp) }
+            if (tracking) {
+                // จอรีเฟรช 90/120Hz ไม่จำเป็นต้องตามทุกเฟรม: จำกัด ~65 fps ตอนเลื่อน และ ~30 fps ตอนนิ่ง
+                val ts = img.timestamp
+                if (ts - lastProc >= (if (idle) GAP_IDLE else GAP_MOVE)) {
+                    lastProc = ts
+                    runCatching { onGray?.invoke(gray(img), ts) }
+                }
+            }
         }, handler)
         vd = proj.createVirtualDisplay("manga", w, h, dpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader.surface, null, handler)
     }
 
-    /** ย่อภาพเป็นเทาโดยเฉลี่ย 2x2 ต่อจุด (เดิมสุ่มจุดเดียว ทำให้เกิด aliasing บนตัวหนังสือ/ลายสกรีน) */
+    /**
+     * ย่อภาพเป็นเทาโดยเฉลี่ย 2x2 ต่อจุด (เดิมสุ่มจุดเดียว ทำให้เกิด aliasing บนตัวหนังสือ/ลายสกรีน)
+     * คัดลอกทีละแถวด้วย bulk get แล้วคำนวณบน ByteArray (เดิมเรียก ByteBuffer.get ~3.5 ล้านครั้งต่อเฟรม) ผลลัพธ์ค่าเดียวกันทุกจุด
+     */
     private fun gray(img: Image): ByteArray {
-        val p = img.planes[0]; val b = p.buffer; val rs = p.rowStride; val ps = p.pixelStride
-        val sw = w / Q; val sh = h / Q; val out = ByteArray(sw * sh)
-        val last = b.limit() - 1
+        val p = img.planes[0]; val rs = p.rowStride; val ps = p.pixelStride
+        val b = p.buffer.duplicate(); val buf = b as java.nio.Buffer
+        val lim = b.limit()
+        val span = sw * Q * ps
+        if (row0.size < span) { row0 = ByteArray(span); row1 = ByteArray(span) }
+        val out = grayBuf
+        val step = Q * ps
         for (y in 0 until sh) {
-            val r0 = y * Q * rs
-            val r1 = r0 + (if (Q > 1) rs else 0)
+            val o0 = y * Q * rs
+            val o1 = o0 + (if (Q > 1) rs else 0)
+            if (o1 + span > lim) break   // ไม่ควรเกิด (บัฟเฟอร์ยาว rs*h) กันไว้ไม่ให้ล้ม
+            buf.position(o0); b.get(row0, 0, span)
+            val r1 = if (Q > 1) { buf.position(o1); b.get(row1, 0, span); row1 } else row0
+            var xi = 0; var oi = y * sw
             for (x in 0 until sw) {
-                val i0 = r0 + x * Q * ps; val i1 = r1 + x * Q * ps
-                var sum = 0
-                for (k in 0..3) {
-                    val i = (if (k < 2) i0 else i1) + (k and 1) * ps
-                    if (i + 2 > last) continue
-                    sum += ((b.get(i).toInt() and 255) * 77 + (b.get(i + 1).toInt() and 255) * 150 + (b.get(i + 2).toInt() and 255) * 29) shr 8
-                }
-                out[y * sw + x] = (sum shr 2).toByte()
+                val c = xi + ps
+                val s0 = ((row0[xi].toInt() and 255) * 77 + (row0[xi + 1].toInt() and 255) * 150 + (row0[xi + 2].toInt() and 255) * 29) shr 8
+                val s1 = ((row0[c].toInt() and 255) * 77 + (row0[c + 1].toInt() and 255) * 150 + (row0[c + 2].toInt() and 255) * 29) shr 8
+                val s2 = ((r1[xi].toInt() and 255) * 77 + (r1[xi + 1].toInt() and 255) * 150 + (r1[xi + 2].toInt() and 255) * 29) shr 8
+                val s3 = ((r1[c].toInt() and 255) * 77 + (r1[c + 1].toInt() and 255) * 150 + (r1[c + 2].toInt() and 255) * 29) shr 8
+                out[oi++] = ((s0 + s1 + s2 + s3) shr 2).toByte()
+                xi += step
             }
         }
         return out

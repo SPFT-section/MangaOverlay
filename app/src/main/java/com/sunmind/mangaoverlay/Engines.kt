@@ -46,6 +46,17 @@ object Ocr {
     private val junkRe = Regex("(?i)(https?:|www\\.|\\w\\.(com|net|org)\\b|@\\w)")
     private val noLetterRe = Regex("^[\\d\\s\\p{Punct}]+$")
     private val wordRe = Regex("[A-Za-z]+(?:'[A-Za-z]+)*")
+    // Regex ที่เคยถูกคอมไพล์ใหม่ทุกครั้งที่เรียก (ทุกกรอบ ทุกการสแกน) ยกมาเป็นค่าคงที่
+    private val ws = Regex("\\s+")
+    private val zeroInCaps = Regex("(?<=[A-Z])0(?=[A-Z])")
+    private val oneInCaps = Regex("(?<=[A-Z])1(?=[A-Z])")
+    private val aposGap = Regex("(?i)(?<=[a-z])\\s*'\\s*(?=(?:t|s|m|d|ll|re|ve)\\b)")
+    private val loneI = Regex("\\bi\\b")
+    private val iApos = Regex("\\bi'")
+    // พิกเซลของภาพที่กำลัง OCR ใช้ buffer เดียวซ้ำ (เดิมจอง IntArray ~10MB ใหม่ทุกการสแกน); full()/strip() ไม่รันซ้อนกันจึงปลอดภัย
+    private var pxBuf = IntArray(0)
+    @Synchronized private fun pixels(n: Int): IntArray { if (pxBuf.size < n) pxBuf = IntArray(n); return pxBuf }
+    @Synchronized fun release() { pxBuf = IntArray(0) }
     private val stop: Set<String> = ("a an the i me my mine we us our you your he him his she her it its they them their this that these those " +
         "am is are was were be been being do does did have has had will would shall should can could may might must " +
         "and or but if so as of at by for in on to up out off over into from with about than then there here when where who whom whose which what why how " +
@@ -64,7 +75,7 @@ object Ocr {
         return withContext(Dispatchers.Default) {
             try {
                 val w = bmp.width; val h = bmp.height
-                val px = IntArray(w * h); bmp.getPixels(px, 0, w, 0, 0, w, h)
+                val px = pixels(w * h); bmp.getPixels(px, 0, w, 0, 0, w, h)
                 val img = Img(px, w, h)
                 val bl = blocks(img, t, minTop).take(40)
                 val texts = bl.map { normalize(it.text) }
@@ -108,9 +119,9 @@ object Ocr {
         var s = s0.replace("-\n", "").replace("\n", " ")
             .replace('\u2019', '\'').replace('\u2018', '\'').replace('\u201C', '"').replace('\u201D', '"')
             .replace('|', 'I')
-        s = s.replace(Regex("(?<=[A-Z])0(?=[A-Z])"), "O").replace(Regex("(?<=[A-Z])1(?=[A-Z])"), "I")
-        s = s.replace(Regex("(?i)(?<=[a-z])\\s*'\\s*(?=(?:t|s|m|d|ll|re|ve)\\b)"), "'")
-        s = s.replace(Regex("\\s+"), " ").trim()
+        s = s.replace(zeroInCaps, "O").replace(oneInCaps, "I")
+        s = s.replace(aposGap, "'")
+        s = s.replace(ws, " ").trim()
         // ตัวพิมพ์ใหญ่ล้วนในมังงะ: "l" ตัวเล็กที่โผล่กลางคำใหญ่คือ "I" ที่ OCR อ่านผิด (lT'S, WlLL, lNSIDE)
         val lt = s.filter { it.isLetter() }
         if (lt.length >= 3 && lt.count { it.isUpperCase() } >= lt.length * 0.7) s = s.replace('l', 'I')
@@ -233,7 +244,7 @@ object Ocr {
             if (cap && ch.isLetter()) { sb.append(ch.uppercaseChar()); cap = false } else sb.append(ch)
             if (ch == '.' || ch == '!' || ch == '?') cap = true
         }
-        var t = sb.toString().replace(Regex("\\bi\\b"), "I").replace(Regex("\\bi'"), "I'")
+        var t = sb.toString().replace(loneI, "I").replace(iApos, "I'")
         if (Dict.ready()) t = wordRe.replace(t) { m ->
             val w = m.value; val base = w.substringBefore('\'')
             if (base.length < 3 || base.lowercase() in stop || w.lowercase() in stop || w[0].isUpperCase() || Dict.lookup(base) != null) w
@@ -294,8 +305,10 @@ object Glossary {
         return t
     }
 
+    private val spBeforePunct = Regex("\\s+([!?…])")
+
     fun post(s: String): String {
-        var t = s.replace(joinRe, "$1").replace(Regex("\\s+([!?…])"), "$1")
+        var t = s.replace(joinRe, "$1").replace(spBeforePunct, "$1")
         if (t.endsWith(".") && !t.endsWith("..")) t = t.dropLast(1)
         return t
     }
@@ -347,9 +360,11 @@ object Dict {
     }
 
     /** แปลทีละคำ/วลี (จับคู่วลีสูงสุด 3 คำ) ใช้เมื่อเน็ตและโมเดลออฟไลน์ใช้ไม่ได้ */
+    private val dictWord = Regex("[A-Za-z]+(?:'[A-Za-z]+)?")
+
     fun translate(s: String): String {
         val m = map ?: return ""
-        val words = Regex("[A-Za-z]+(?:'[A-Za-z]+)?").findAll(s).map { it.value }.toList()
+        val words = dictWord.findAll(s).map { it.value }.toList()
         val out = ArrayList<String>(); var hit = 0; var i = 0
         while (i < words.size) {
             var done = false
@@ -393,10 +408,10 @@ object Translator {
     @Volatile private var offlineReady = false
     @Volatile private var lastErr = ""
     @Volatile private var lastEngine = ""
-    @Volatile private var googleFails = 0
-    @Volatile private var googleDownUntil = 0L
-    @Volatile private var edgeFails = 0
-    @Volatile private var edgeDownUntil = 0L
+    private class Stat(init: Double) { @Volatile var ewma = init; @Volatile var fails = 0; @Volatile var downUntil = 0L }
+    private val gStat = Stat(450.0)   // Google: ค่าเฉลี่ยความหน่วง (ms) + เวลาที่พักตัวเมื่อล้มติดกัน
+    private val eStat = Stat(500.0)   // Bing/Edge
+    private val bg = CoroutineScope(SupervisorJob() + Dispatchers.IO)   // ตัวแข่งรันอิสระ: ผู้ชนะส่งผลกลับทันที ไม่ต้องรอตัวที่ช้ากว่า
     @Volatile private var edgeTok: String? = null
     @Volatile private var edgeExp = 0L
     @Volatile private var glKey: String? = null
@@ -443,6 +458,7 @@ object Translator {
     @Synchronized fun close() {
         onStatus = null
         saveDisk()
+        bg.coroutineContext.cancelChildren()
         client?.close(); client = null; offlineReady = false
     }
     private fun status(m: String) { onStatus?.invoke(m) }
@@ -452,7 +468,7 @@ object Translator {
     suspend fun warmUp() = coroutineScope {
         launch(Dispatchers.IO) { Dict.load(app) }
         launch(Dispatchers.IO) { callRetry("hi") }
-        launch(Dispatchers.IO) { edgeToken(false) }
+        launch(Dispatchers.IO) { edge(listOf("hi")) }   // ได้ทั้ง token และ TLS/HTTP connection ไปยังเซิร์ฟเวอร์แปล
         launch {
             try {
                 offline.downloadModelIfNeeded(DownloadConditions.Builder().build()).await()
@@ -465,7 +481,7 @@ object Translator {
     suspend fun translate(src: List<String>, strict: Boolean = true, force: Boolean = false): List<String?> = withContext(Dispatchers.IO) {
         val res = HashMap<String, String>()
         val miss = ArrayList<String>()
-        if (force) { googleDownUntil = 0; edgeDownUntil = 0; googleFails = 0; edgeFails = 0 }
+        if (force) { gStat.downUntil = 0; eStat.downUntil = 0; gStat.fails = 0; eStat.fails = 0 }
         for (s in src.distinct()) {
             val ph = if (Prefs.mangaStyle) Manga.phrase(s) else null
             if (ph != null) { res[s] = ph; continue }
@@ -473,7 +489,7 @@ object Translator {
             if (c != null) res[s] = c else miss.add(s)
         }
         if (miss.isNotEmpty()) coroutineScope {
-            miss.chunked(12).map { ch -> async { runChain(ch, strict) } }.awaitAll().forEach { res.putAll(it) }
+            miss.chunked(20).map { ch -> async { runChain(ch, strict) } }.awaitAll().forEach { res.putAll(it) }
         }
         src.map { res[it]?.takeIf { t -> t.isNotBlank() } }
     }
@@ -489,7 +505,7 @@ object Translator {
         for (s in all) { val c = cache.get(s); if (c != null && s in aiSet) out[s] = c else need.add(s) }
         if (need.isEmpty()) return@withContext out
         aiGate.withLock {
-            for (ch in need.chunked(30)) {
+            for (ch in need.chunked(40)) {
                 var r: List<String>? = null
                 for (attempt in 0..1) { r = Llm.translate(ch); if (r != null) break; delay(400) }
                 if (r == null) { status("AI แปลไม่ได้ (${Llm.lastErr}) ใช้ผลจากเครื่องแปลแทน"); continue }
@@ -503,6 +519,46 @@ object Translator {
         out
     }
 
+    private class Race(val name: String, val map: Map<String, String>?, val netFail: Boolean)
+
+    /**
+     * Google กับ Bing แข่งกัน (hedged request): ตัวที่ค่าเฉลี่ยความหน่วงต่ำกว่าเริ่มก่อน อีกตัวเริ่มตามหลังเมื่อตัวแรกยังไม่เสร็จภายใน hedge ms
+     * (หรือทันทีที่ตัวแรกล้ม) ใครได้ผลครบก่อนชนะ — เดิมรอ Google ล้ม/หมดเวลาก่อนแล้วค่อยลอง Bing ซึ่งช้าได้เกิน 10 วินาทีเมื่อเน็ตไม่ดี
+     */
+    private suspend fun raceOnline(lines: List<String>): Race {
+        class Eng(val name: String, val st: Stat, val run: () -> Map<String, String>?)
+        val now = System.currentTimeMillis()
+        val engs = ArrayList<Eng>(2)
+        if (now >= gStat.downUntil) engs.add(Eng("Google", gStat) { google(lines) })
+        if (now >= eStat.downUntil) engs.add(Eng("Bing", eStat) { edge(lines) })
+        if (engs.isEmpty()) return Race("", null, false)
+        engs.sortBy { it.st.ewma }
+        val win = CompletableDeferred<Race>()
+        val firstDone = CompletableDeferred<Unit>()
+        val left = java.util.concurrent.atomic.AtomicInteger(engs.size)
+        val anyFail = java.util.concurrent.atomic.AtomicBoolean(false)
+        val hedge = (engs[0].st.ewma * 1.6).toLong().coerceIn(450L, 1200L)
+        engs.forEachIndexed { i, en ->
+            bg.launch {
+                try {
+                    if (i > 0) { withTimeoutOrNull(hedge) { firstDone.await() }; if (win.isCompleted) return@launch }
+                    val t0 = System.currentTimeMillis()
+                    val r = try { en.run() } catch (e: Exception) { null }
+                    val t1 = System.currentTimeMillis()
+                    if (r == null) {
+                        anyFail.set(true)
+                        if (++en.st.fails >= 2) en.st.downUntil = t1 + 30000
+                        en.st.ewma = max(en.st.ewma, 1500.0)
+                    } else { en.st.fails = 0; en.st.ewma = 0.7 * en.st.ewma + 0.3 * (t1 - t0) }
+                    if (i == 0) firstDone.complete(Unit)
+                    if (!r.isNullOrEmpty()) win.complete(Race(en.name, r, false))
+                    else if (left.decrementAndGet() == 0) win.complete(Race("", null, anyFail.get()))
+                } catch (e: CancellationException) { win.complete(Race("", null, false)); throw e }
+            }
+        }
+        return win.await()
+    }
+
     private suspend fun runChain(chunk: List<String>, strict: Boolean): Map<String, String> {
         val got = HashMap<String, String>()
         var rest = chunk
@@ -512,24 +568,15 @@ object Translator {
             setEngine(engine)
             rest = rest.filter { it !in got }
         }
-        val now = System.currentTimeMillis()
-        // 1) Google (ส่งเป็นชุดเดียว จับคู่ทีละบรรทัดจาก segment ที่ Google ส่งกลับ)
-        if (now >= googleDownUntil) {
-            val g = google(rest)
-            if (g.isNotEmpty()) { googleFails = 0; take(g, "Google") }
-            else { if (++googleFails >= 2) googleDownUntil = now + 30000; status("Google แปลไม่ได้ ($lastErr)") }
-        }
-        // 2) Bing/Edge (ส่งเป็น array จับคู่ตามลำดับ แม่นและไม่ถูกบล็อกพร้อม Google)
-        if (rest.isNotEmpty() && System.currentTimeMillis() >= edgeDownUntil) {
-            val e = edge(rest)
-            if (e.isNotEmpty()) { edgeFails = 0; take(e, "Bing") }
-            else if (++edgeFails >= 2) edgeDownUntil = System.currentTimeMillis() + 30000
-        }
-        // 3) Google ทีละบรรทัด (ช้าลงนิดหน่อยแต่ครบ) เมื่อทั้งชุดจับคู่ไม่ได้
-        if (rest.isNotEmpty() && System.currentTimeMillis() >= googleDownUntil) take(googleEach(rest), "Google")
-        // 4) ML Kit ออฟไลน์
+        // 1) Google/Bing แข่งกัน (ได้ผลครบทั้งชุดจากตัวเดียว จับคู่ตามลำดับ/ตาม segment)
+        val race = raceOnline(rest)
+        if (race.map != null) take(race.map, race.name)
+        else if (race.netFail) status("แปลออนไลน์ไม่ได้ ($lastErr)")
+        // 2) Google ทีละบรรทัด เฉพาะกรณีจับคู่ทั้งชุดไม่ลงตัว (ถ้าเน็ตล้มจริงไม่ลองซ้ำ จะได้ไม่เสียเวลารอ timeout อีกรอบ)
+        if (rest.isNotEmpty() && race.map == null && !race.netFail && System.currentTimeMillis() >= gStat.downUntil) take(googleEach(rest), "Google")
+        // 3) ML Kit ออฟไลน์
         if (rest.isNotEmpty() && offlineReady) take(offline(rest), "ออฟไลน์ (ML Kit)")
-        // 5) พจนานุกรม (ศัพท์สั้น ๆ เท่านั้น)
+        // 4) พจนานุกรม (ศัพท์สั้น ๆ เท่านั้น)
         if (rest.isNotEmpty()) {
             if (!Dict.ready()) Dict.load(app)
             val d = rest.filter { !strict || it.split(' ').count { w -> w.isNotBlank() } <= 4 }
@@ -549,11 +596,12 @@ object Translator {
     }
 
     // ---------------- Google ----------------
-    private fun google(chunk: List<String>): Map<String, String> {
+    /** null = เครือข่าย/HTTP ล้มเหลว, map ว่าง = ได้คำตอบแต่จับคู่กับบรรทัดต้นฉบับไม่ลงตัว */
+    private fun google(chunk: List<String>): Map<String, String>? {
         if (chunk.isEmpty()) return emptyMap()
         val out = HashMap<String, String>()
         val pre = chunk.map { Glossary.pre(it) }
-        val arr = callArr(pre.joinToString("\n")) ?: return out
+        val arr = callArr(pre.joinToString("\n")) ?: return null
         val joined = lines(arr)
         if (joined.size == chunk.size) chunk.indices.forEach { if (joined[it].isNotBlank()) out[chunk[it]] = joined[it] }
         return out   // จับคู่ไม่ลงตัว -> ปล่อยให้ชั้นถัดไปจัดการ (ไม่ยิงทีละบรรทัดทันที กันโดนจำกัดอัตรา)
@@ -598,7 +646,7 @@ object Translator {
             try {
                 if (!post && enc.length > 3500) continue
                 c = URL(if (post) base else "$base&q=$enc").openConnection() as HttpURLConnection
-                c.connectTimeout = 2500; c.readTimeout = 4000
+                c.connectTimeout = 2000; c.readTimeout = 3500
                 c.setRequestProperty("User-Agent", UA)
                 if (post) {
                     c.requestMethod = "POST"; c.doOutput = true
@@ -609,7 +657,8 @@ object Translator {
                 val body = c.inputStream.bufferedReader().use { it.readText() }
                 clean = true // อ่านจนจบและปิดสตรีมแล้ว: ปล่อยให้ connection กลับเข้า pool เพื่อใช้ซ้ำ
                 return JSONArray(body).getJSONArray(0)
-            } catch (e: Exception) { lastErr = e.javaClass.simpleName }
+            } catch (e: java.net.SocketTimeoutException) { lastErr = "timeout"; return null }   // หมดเวลา: ลองด้วย GET ก็ไม่ช่วย
+            catch (e: Exception) { lastErr = e.javaClass.simpleName }
             finally { if (!clean) c?.disconnect() }
         }
         return null
@@ -635,11 +684,12 @@ object Translator {
         finally { c?.disconnect() }
     }
 
-    private fun edge(chunk: List<String>): Map<String, String> {
+    /** null = เครือข่าย/HTTP/token ล้มเหลว, map ว่าง = จำนวนผลไม่ตรงกับที่ส่ง */
+    private fun edge(chunk: List<String>): Map<String, String>? {
         if (chunk.isEmpty()) return emptyMap()
         val body = JSONArray().also { a -> chunk.forEach { a.put(JSONObject().put("Text", Glossary.pre(it))) } }.toString()
         for (attempt in 0..1) {
-            val tok = edgeToken(attempt == 1) ?: return emptyMap()
+            val tok = edgeToken(attempt == 1) ?: return null
             var c: HttpURLConnection? = null
             try {
                 c = URL("https://api-edge.cognitive.microsofttranslator.com/translate?from=en&to=th&api-version=3.0").openConnection() as HttpURLConnection
@@ -650,7 +700,7 @@ object Translator {
                 c.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
                 val code = c.responseCode
                 if (code == 401) { edgeTok = null; c.errorStream?.close(); continue }
-                if (code != 200) { lastErr = "Bing HTTP $code"; c.errorStream?.close(); return emptyMap() }
+                if (code != 200) { lastErr = "Bing HTTP $code"; c.errorStream?.close(); return null }
                 val arr = JSONArray(c.inputStream.bufferedReader().use { it.readText() })
                 if (arr.length() != chunk.size) return emptyMap()
                 val out = HashMap<String, String>()
@@ -659,9 +709,9 @@ object Translator {
                     if (t.isNotBlank()) out[chunk[i]] = t
                 }
                 return out
-            } catch (e: Exception) { lastErr = e.javaClass.simpleName; return emptyMap() }
+            } catch (e: Exception) { lastErr = e.javaClass.simpleName; return null }
             finally { c?.disconnect() }
         }
-        return emptyMap()
+        return null
     }
 }

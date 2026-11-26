@@ -74,12 +74,15 @@ object Manga {
         add("slash", "ฉับ"); add("clang|clank", "แคร้ง"); add("stomp", "ตึง"); add("bzzt|zap", "ซ่า"); add("splat", "แปะ"); add("poof", "ฟุบ"); add("pop", "ป๊อก")
     }
 
+    private val ws = Regex("\\s+")
+    private val spBeforePunct = Regex("\\s*([!?…]+)")
+    private val multiSpace = Regex("\\s{2,}")
     private val full = Regex("^([^A-Za-z]*)([A-Za-z][A-Za-z' ,\\-]*?)([\\s.!?…~]*)$")
 
     /** ถ้าทั้งกรอบเป็นวลีสั้นที่อยู่ในตาราง คืนคำไทย พร้อมเครื่องหมายท้ายประโยคตามต้นฉบับ */
     fun phrase(src: String): String? {
         val m = full.matchEntire(src.trim()) ?: return null
-        val core = m.groupValues[2].lowercase().replace(",", "").replace(Regex("\\s+"), " ").trim()
+        val core = m.groupValues[2].lowercase().replace(",", "").replace(ws, " ").trim()
         val th = book[core] ?: return null
         val lead = if (m.groupValues[1].contains('.') || m.groupValues[1].contains('…')) "…" else ""
         val tail = m.groupValues[3]
@@ -104,7 +107,7 @@ object Manga {
         var t = th.trim()
         if (!politeCue.containsMatchIn(en)) t = t.replace(tailPolite, "")
         for ((r, b) in rules) t = r.replace(t, b)
-        t = t.replace(Regex("\\s*([!?…]+)"), "$1").replace(Regex("\\s{2,}"), " ").trim()
+        t = t.replace(spBeforePunct, "$1").replace(multiSpace, " ").trim()
         return if (t.isBlank()) th else t
     }
 }

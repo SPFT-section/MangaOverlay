@@ -27,6 +27,8 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.core.widget.TextViewCompat
 import kotlinx.coroutines.*
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import org.opencv.android.OpenCVLoader
 import kotlin.math.abs
 import kotlin.math.max
@@ -54,7 +56,22 @@ class OverlayService : Service() {
     private var statTotal = 0; private var statDone = 0; private var statAi = false
     private var active = false; private var busy = false; private var lost = false
     private val restRun = Runnable { px = 0f; py = 0f; if (::container.isInitialized) applyTransform() }
-    private var settleJob: Job? = null
+    // ใช้ Runnable เดียวต่อเรื่อง (removeCallbacks+postDelayed) แทนการสร้าง coroutine ใหม่ทุกเฟรม (เดิม ~60 ตัว/วินาที)
+    private val settleRun = Runnable { scope.launch { onSettle() } }
+    private val emptyRun = Runnable { scope.launch { if (active && !busy && container.childCount == 0) full() } }
+    // ผลติดตามจาก thread ของ Capture: เก็บเฉพาะค่าล่าสุด และมีงานค้างบน main ได้แค่ 1 งาน (ท่าเป็นค่าสะสมสัมบูรณ์ การข้ามเฟรมกลางทางจึงไม่เสียข้อมูล)
+    private val latestDisp = AtomicReference<Disp?>(null)
+    private val dispPosted = AtomicBoolean(false)
+    private val pendMoved = AtomicBoolean(false)
+    private val pendLost = AtomicBoolean(false)
+    private val dispRun = Runnable {
+        dispPosted.set(false)
+        val d = latestDisp.getAndSet(null) ?: return@Runnable
+        val mv = pendMoved.getAndSet(false); val ls = pendLost.getAndSet(false)
+        // สัญญาณ moved/lost ของเฟรมที่ถูกข้ามต้องไม่หาย
+        applyStep(if ((mv && !d.moved) || (ls && !d.lost)) Disp(d.pose, d.vx, d.vy, d.ok, d.still, d.lost || ls, d.moved || mv) else d)
+    }
+    private var mx = 0f; private var my = 0f; private var ms = 1f   // transform ที่ใช้สร้าง mask ครั้งล่าสุด
     private var busyUi = false; private var peeking = false; private var rescanQ = false
     private var menu: LinearLayout? = null; private var menuLp: WLP? = null
     private var lastTap = 0L; private var tapRun: Runnable? = null; private var longFired = false
@@ -103,7 +120,16 @@ class OverlayService : Service() {
             mp.registerCallback(cb, main)
             capture = Capture(mp, W, H, dm.densityDpi, keeper).also { c ->
                 // รันบน thread ของ Capture: ตามการเลื่อน -> สะสมท่า (ครบทุกเฟรม) -> ส่งให้ UI วาด
-                c.onGray = { g, ts -> tracker.step(g, mask)?.let { s -> val d = keeper.update(s, ts); main.post { applyStep(d) } } }
+                c.onGray = { g, ts ->
+                    tracker.step(g, mask)?.let { s ->
+                        val d = keeper.update(s, ts)
+                        c.idle = d.still && d.ok                 // นิ่ง = ลดอัตราการตาม
+                        if (d.moved) pendMoved.set(true)
+                        if (d.lost) pendLost.set(true)
+                        latestDisp.set(d)
+                        if (dispPosted.compareAndSet(false, true)) main.post(dispRun)
+                    }
+                }
             }
             buildLayer(); buildButton()
             running = true; notifyTile()
@@ -332,7 +358,8 @@ class OverlayService : Service() {
     // ---------- tracking ----------
     private fun applyTransform() {
         container.scaleX = sc; container.scaleY = sc; container.translationX = tx + px; container.translationY = ty + py
-        updateMask()
+        // mask มีขอบเผื่อ 8px จึงไม่ต้องสร้างใหม่ทุกเฟรม (เดิมสร้าง List<Rect> ใหม่ทุกเฟรมบน main thread) อัปเดตเมื่อขยับเกิน 2px
+        if (abs(tx - mx) > 2f || abs(ty - my) > 2f || abs(sc - ms) > 0.002f) updateMask()
     }
 
     private fun applyStep(d: Disp) {
@@ -346,10 +373,7 @@ class OverlayService : Service() {
         main.removeCallbacks(restRun); main.postDelayed(restRun, 90)   // หยุดเลื่อน = คืนตำแหน่งจริง ไม่ค้างค่าคาดการณ์
         if (container.childCount == 0) {
             // หน้าแรกไม่พบข้อความ: พอเลื่อนไปหน้าที่มีข้อความแล้วหยุดนิ่ง ต้องสแกนใหม่เอง
-            if (d.moved) {
-                settleJob?.cancel()
-                settleJob = scope.launch { delay(350); if (active && !busy && container.childCount == 0) full() }
-            }
+            if (d.moved) { main.removeCallbacks(emptyRun); main.postDelayed(emptyRun, 350) }
             return
         }
         // ตามไม่ได้ชั่วคราวไม่ซ่อนกรอบ (เดิมซ่อนทันทีแล้วสแกนใหม่ทั้งหน้า = กระพริบ) จะซ่อนก็ต่อเมื่อหลงตำแหน่งจริง
@@ -357,12 +381,12 @@ class OverlayService : Service() {
         else if (container.visibility != View.VISIBLE && !lost) container.visibility = View.VISIBLE
         applyTransform()
         if (!lost && !busy && abs(p.acc) > H * 0.25f && abs(sc - 1f) <= 0.03f) scope.launch { strip() }
-        settleJob?.cancel()
-        settleJob = scope.launch { delay(150); scope.launch { onSettle() } }
+        main.removeCallbacks(settleRun); main.postDelayed(settleRun, 150)
     }
 
     private fun updateMask() {
-        val l = ArrayList<Rect>()
+        mx = tx; my = ty; ms = sc
+        val l = ArrayList<Rect>(container.childCount + 2)
         for (i in 0 until container.childCount) {
             val p = container.getChildAt(i).layoutParams as FrameLayout.LayoutParams
             l.add(Rect((p.leftMargin * sc + tx).toInt() - 8, (p.topMargin * sc + ty).toInt() - 8,
@@ -381,7 +405,7 @@ class OverlayService : Service() {
         try {
             val hide = container.visibility == View.VISIBLE && container.childCount > 0
             container.removeAllViews()
-            tracker.reset()
+            tracker.reset(); capture?.idle = false
             // ตั้งต้นท่าที่เฟรมของภาพที่จะ OCR พอดี: ถ้าผู้ใช้เลื่อนหน้าระหว่างรอ OCR/แปล กรอบจะเลื่อนตามไปถูกที่ ไม่เพี้ยน
             val snap = capture!!.snapshot(if (hide) listOf(container) else emptyList(), hide, resetPose = true)
             epoch = snap.pose.epoch; sc = 1f; tx = 0f; ty = 0f; px = 0f; py = 0f
@@ -397,7 +421,7 @@ class OverlayService : Service() {
 
     private suspend fun onSettle() {
         if (!active) return
-        if (busy) { settleJob = scope.launch { delay(250); onSettle() }; return }
+        if (busy) { main.removeCallbacks(settleRun); main.postDelayed(settleRun, 250); return }
         if (lost || abs(sc - 1f) > 0.03f) { full(); return }
         if (abs(keeper.now().acc) >= H * 0.06f) strip() else prune()
     }
@@ -529,6 +553,8 @@ class OverlayService : Service() {
         runCatching { dismissMenu() }
         Translator.close()
         capture?.release(); capture = null
+        if (::tracker.isInitialized) tracker.release()
+        Ocr.release()
         projCb?.let { cb -> runCatching { proj?.unregisterCallback(cb) } }
         runCatching { proj?.stop() }; proj = null
         runCatching { wm.removeView(layer) }; runCatching { wm.removeView(btn) }

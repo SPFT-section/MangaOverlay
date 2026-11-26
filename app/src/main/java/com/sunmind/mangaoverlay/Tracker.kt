@@ -19,34 +19,50 @@ class Step(val s: Float, val tx: Float, val ty: Float, val ok: Boolean, val stil
  * ตามไม่ได้ = ไม่ขยับ "เฟรมอ้างอิง" ครั้งต่อไปจึงเทียบข้ามช่วงที่ตามไม่ได้ และได้ระยะเลื่อนที่ขาดไปกลับมาครบ
  */
 class Tracker(private val sw: Int, private val sh: Int) {
-    private var prev: Mat? = null
+    // Mat ทั้งหมดสร้างครั้งเดียวแล้วใช้ซ้ำ (เดิมสร้าง/คืน ~1MB ต่อเฟรม ที่ 60 เฟรม/วินาที = ภาระ malloc และ GC ฝั่ง native โดยไม่จำเป็น)
+    private val pool = arrayOf(Mat(sh, sw, CvType.CV_8UC1), Mat(sh, sw, CvType.CV_8UC1))
+    private var prevIdx = -1            // ตำแหน่งใน pool ของเฟรมอ้างอิง (-1 = ยังไม่มี)
     private var gap = 0
     private val hann = Mat()
+    private val base = Mat(sh, sw, CvType.CV_8UC1, Scalar(255.0))   // หน้ากากพื้นฐาน (ตัดแถบบน/ล่างของจอ)
+    private val m = Mat(sh, sw, CvType.CV_8UC1)                     // หน้ากากต่อเฟรม = base + กรอบโอเวอร์เลย์
+    private val diff = Mat()
+    private var closed = false
 
-    init { Imgproc.createHanningWindow(hann, Size(sw.toDouble(), sh.toDouble()), CvType.CV_32F) }
+    init {
+        Imgproc.createHanningWindow(hann, Size(sw.toDouble(), sh.toDouble()), CvType.CV_32F)
+        Imgproc.rectangle(base, Point(0.0, 0.0), Point(sw.toDouble(), sh * 0.04), Scalar(0.0), -1)
+        Imgproc.rectangle(base, Point(0.0, sh * 0.95), Point(sw.toDouble(), sh.toDouble()), Scalar(0.0), -1)
+    }
 
-    // reset() ถูกเรียกจาก main thread ขณะ step() รันบน thread ของ Capture -> ต้องล็อก ไม่งั้น Mat ถูก release ซ้อน (native crash)
-    @Synchronized fun reset() { prev?.release(); prev = null; gap = 0 }
+    // reset() ถูกเรียกจาก main thread ขณะ step() รันบน thread ของ Capture -> ต้องล็อก ไม่งั้น Mat ถูกใช้ซ้อน (native crash)
+    @Synchronized fun reset() { prevIdx = -1; gap = 0 }
+
+    /** คืนหน่วยความจำ native เมื่อปิดบริการ */
+    @Synchronized fun release() {
+        if (closed) return
+        closed = true; prevIdx = -1
+        for (x in pool) x.release()
+        base.release(); m.release(); diff.release(); hann.release()
+    }
 
     private fun detect(g: Mat, m: Mat, pts: MatOfPoint) = Imgproc.goodFeaturesToTrack(g, pts, 300, 0.004, 5.0, m)
 
     /** นอกกรอบโอเวอร์เลย์ ภาพแทบไม่เปลี่ยน = หน้าจอนิ่ง */
     private fun still(p: Mat, cur: Mat, m: Mat): Boolean {
-        val d = Mat()
-        return try { Core.absdiff(p, cur, d); Core.mean(d, m).`val`[0] < 0.6 } finally { d.release() }
+        Core.absdiff(p, cur, diff)
+        return Core.mean(diff, m).`val`[0] < 0.6
     }
 
     @Synchronized
     fun step(g: ByteArray, mask: List<Rect>): Step? {
-        if (g.size < sw * sh) return null
-        val cur = Mat(sh, sw, CvType.CV_8UC1); cur.put(0, 0, g)
+        if (closed || g.size < sw * sh) return null
+        val ci = if (prevIdx == 0) 1 else 0
+        val cur = pool[ci]; cur.put(0, 0, g)
         Imgproc.GaussianBlur(cur, cur, Size(3.0, 3.0), 0.0)
-        val p = prev
-        if (p == null) { prev = cur; return null }
-        val base = Mat(sh, sw, CvType.CV_8UC1, Scalar(255.0))
-        Imgproc.rectangle(base, Point(0.0, 0.0), Point(sw.toDouble(), sh * 0.04), Scalar(0.0), -1)
-        Imgproc.rectangle(base, Point(0.0, sh * 0.95), Point(sw.toDouble(), sh.toDouble()), Scalar(0.0), -1)
-        val m = base.clone()
+        val p = if (prevIdx >= 0) pool[prevIdx] else null
+        if (p == null) { prevIdx = ci; return null }
+        base.copyTo(m)
         var res: Step? = null
         try {
             for (r in mask) Imgproc.rectangle(m, Point(r.left.toDouble() / Q, r.top.toDouble() / Q),
@@ -56,11 +72,10 @@ class Tracker(private val sw: Int, private val sh: Int) {
                 res = lkTranslate(p, cur, m, base) ?: lkSimilarity(p, cur, m, base) ?: phase(p, cur)
             }
         } catch (e: Exception) { res = null }
-        finally { base.release(); m.release() }
-        if (res != null && res.ok) { p.release(); prev = cur; gap = 0 }
+        if (res != null && res.ok) { prevIdx = ci; gap = 0 }
         else {
             // ตามไม่ได้: เก็บเฟรมอ้างอิงเดิมไว้เทียบข้ามช่องว่าง (สูงสุด 12 เฟรม แล้วค่อยยอมเลื่อนไปเฟรมใหม่)
-            if (++gap > 12) { p.release(); prev = cur; gap = 0 } else cur.release()
+            if (++gap > 12) { prevIdx = ci; gap = 0 }
         }
         return res ?: Step(1f, 0f, 0f, false)
     }
