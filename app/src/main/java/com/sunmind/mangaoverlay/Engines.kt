@@ -27,26 +27,56 @@ import kotlin.coroutines.resumeWithException
 
 class Item(val r: Rect, val text: String, val bg: Int, val bubble: Boolean = false)
 
+/** items = กรอบที่พร้อมวาง, tr = คำแปล (เริ่มแปลไปพร้อมกับการหากรอบ จึงมักเสร็จก่อน/พร้อมกัน) */
+class Found(val items: List<Item>, val tr: Deferred<Map<String, String?>>)
+
+/** พิกเซลทั้งภาพอ่านครั้งเดียว (เดิมเรียก getPixel ทีละจุดหลายหมื่นครั้ง) */
+private class Img(val px: IntArray, val w: Int, val h: Int) {
+    fun p(x: Int, y: Int) = px[y.coerceIn(0, h - 1) * w + x.coerceIn(0, w - 1)]
+    fun lum(x: Int, y: Int): Int { val c = p(x, y); return (77 * Color.red(c) + 150 * Color.green(c) + 29 * Color.blue(c)) shr 8 }
+}
+
 object Ocr {
     private val rec = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
     private const val ST = 2      // ลดความละเอียดตอนหากรอบคำพูด
     private const val TOL = 28    // ความต่างความสว่างที่ยังนับเป็นพื้นกรอบเดียวกัน
     private val junkRe = Regex("(?i)(https?:|www\\.|\\w\\.(com|net|org)\\b|@\\w)")
     private val noLetterRe = Regex("^[\\d\\s\\p{Punct}]+$")
+    private val wordRe = Regex("[A-Za-z]+(?:'[A-Za-z]+)*")
+    private val stop: Set<String> = ("a an the i me my mine we us our you your he him his she her it its they them their this that these those " +
+        "am is are was were be been being do does did have has had will would shall should can could may might must " +
+        "and or but if so as of at by for in on to up out off over into from with about than then there here when where who whom whose which what why how " +
+        "not no yes oh ah uh um hey hmm well just very too also only even still already again ever never always all any some each every both more most much many " +
+        "such own same other another few little lot lots now let get got go going gonna wanna gotta kinda dunno gotcha lemme gimme ya yo huh heh haha ahh ohh ugh argh " +
+        "okay ok yeah yep nope please thanks thank sorry dont doesnt didnt isnt arent wasnt werent wont cant couldnt shouldnt wouldnt").split(' ').toHashSet()
 
     private class Blk(val r: Rect, val text: String, val lh: Int)
     private class Fit(val r: Rect, val bg: Int)
 
-    suspend fun run(bmp: Bitmap, minTop: Int = 0): List<Item> {
+    suspend fun run(bmp: Bitmap, scope: CoroutineScope, minTop: Int = 0): Found {
+        val none = Found(emptyList(), CompletableDeferred<Map<String, String?>>(emptyMap()))
         val t = try { rec.process(InputImage.fromBitmap(bmp, 0)).await() }
                 catch (e: CancellationException) { throw e }   // ห้ามกลืน cancellation
-                catch (e: Exception) { return emptyList() }
+                catch (e: Exception) { return none }
         return withContext(Dispatchers.Default) {
-            try { build(bmp, t, minTop) } catch (e: Exception) { emptyList() } // กันกรอบ/พิกเซลเกินขอบจนแอปล้ม
+            try {
+                val w = bmp.width; val h = bmp.height
+                val px = IntArray(w * h); bmp.getPixels(px, 0, w, 0, 0, w, h)
+                val img = Img(px, w, h)
+                val bl = blocks(img, t, minTop).take(40)
+                val texts = bl.map { normalize(it.text) }
+                // เริ่มแปลทันที ขนานไปกับการหากรอบคำพูด (เดิมต้องรอหากรอบเสร็จก่อนถึงเริ่มแปล)
+                val tr = scope.async(Dispatchers.IO) {
+                    val d = texts.distinct()
+                    d.zip(Translator.translate(d, strict = true)).toMap()
+                }
+                val items = bl.mapIndexed { i, b -> async { toItem(img, b, texts[i]) } }.awaitAll()
+                Found(items, tr)
+            } catch (e: CancellationException) { throw e } catch (e: Exception) { none }
         }
     }
 
-    private fun build(bmp: Bitmap, t: Text, minTop: Int): List<Item> {
+    private fun blocks(img: Img, t: Text, minTop: Int): List<Blk> {
         val raw = ArrayList<Blk>()
         for (b in t.textBlocks) {
             val bb = b.boundingBox ?: continue
@@ -57,16 +87,16 @@ object Ocr {
             val hs = b.lines.mapNotNull { it.boundingBox?.height() }.sorted()
             raw.add(Blk(Rect(bb), s, if (hs.isEmpty()) bb.height() else hs[hs.size / 2]))
         }
-        val blocks = if (Prefs.merge) merge(bmp, raw) else raw
-        val out = ArrayList<Item>()
-        for (b in blocks.sortedWith(compareBy({ it.r.top }, { it.r.left }))) {
+        val merged = if (Prefs.merge) merge(img, raw) else raw
+        return merged.sortedWith(compareBy({ it.r.top }, { it.r.left })).filter { b ->
             val letters = b.text.count { it.isLetter() }
-            if (letters < 2 && b.text != "I" && b.text != "A") continue
-            if (noLetterRe.matches(b.text)) continue
-            val f = if (Prefs.fit) fit(bmp, b.r) else null
-            out.add(Item(f?.r ?: Rect(b.r), normalize(b.text), f?.bg ?: bgOf(bmp, b.r), f != null))
+            !(letters < 2 && b.text != "I" && b.text != "A") && !noLetterRe.matches(b.text)
         }
-        return out
+    }
+
+    private fun toItem(img: Img, b: Blk, text: String): Item {
+        val f = if (Prefs.fit) fit(img, b.r) else null
+        return Item(f?.r ?: Rect(b.r), text, f?.bg ?: bgOf(img, b.r), f != null)
     }
 
     /** แก้ที่ OCR อ่านผิดบ่อยในฟอนต์มังงะ */
@@ -80,11 +110,11 @@ object Ocr {
     }
 
     // ---------- รวมบล็อกที่อยู่ในกรอบคำพูดเดียวกัน ----------
-    private fun merge(bmp: Bitmap, a: List<Blk>): List<Blk> {
+    private fun merge(img: Img, a: List<Blk>): List<Blk> {
         val n = a.size
         val p = IntArray(n) { it }
         fun f(x: Int): Int { var y = x; while (p[y] != y) { p[y] = p[p[y]]; y = p[y] }; return y }
-        for (i in 0 until n) for (j in i + 1 until n) if (same(bmp, a[i], a[j])) p[f(i)] = f(j)
+        for (i in 0 until n) for (j in i + 1 until n) if (same(img, a[i], a[j])) p[f(i)] = f(j)
         return (0 until n).groupBy { f(it) }.values.map { g ->
             val m = g.map { a[it] }.sortedBy { it.r.top }
             val r = Rect(m[0].r)
@@ -93,7 +123,7 @@ object Ocr {
         }
     }
 
-    private fun same(bmp: Bitmap, a: Blk, b: Blk): Boolean {
+    private fun same(img: Img, a: Blk, b: Blk): Boolean {
         val u = if (a.r.top <= b.r.top) a else b
         val d = if (u === a) b else a
         val lo = min(u.lh, d.lh).coerceAtLeast(1)
@@ -103,24 +133,19 @@ object Ocr {
         val gap = d.r.top - u.r.bottom
         if (gap > 1.1f * lo) return false
         if (gap <= 0) return true
-        return !divided(bmp, max(u.r.left, d.r.left), min(u.r.right, d.r.right), u.r.bottom, d.r.top)
-    }
-
-    private fun lumAt(bmp: Bitmap, x: Int, y: Int): Int {
-        val p = bmp.getPixel(x.coerceIn(0, bmp.width - 1), y.coerceIn(0, bmp.height - 1))
-        return (77 * Color.red(p) + 150 * Color.green(p) + 29 * Color.blue(p)) shr 8
+        return !divided(img, max(u.r.left, d.r.left), min(u.r.right, d.r.right), u.r.bottom, d.r.top)
     }
 
     /** มีเส้นขอบกรอบคำพูดคั่นระหว่างสองบล็อกไหม (สแกนแนวตั้ง 3 เส้น ต้องเจอขอบอย่างน้อย 2 เส้น) */
-    private fun divided(bmp: Bitmap, x0: Int, x1: Int, y0: Int, y1: Int): Boolean {
+    private fun divided(img: Img, x0: Int, x1: Int, y0: Int, y1: Int): Boolean {
         if (y1 - y0 < 3) return false
         var hits = 0
         for (k in 1..3) {
             val x = x0 + (x1 - x0) * k / 4
-            val ref = lumAt(bmp, x, y0 + 1)
+            val ref = img.lum(x, y0 + 1)
             var run = 0; var hit = false
             for (y in y0 + 1 until y1) {
-                if (abs(lumAt(bmp, x, y) - ref) > 70) { run++; if (run >= 2) { hit = true; break } } else run = 0
+                if (abs(img.lum(x, y) - ref) > 70) { run++; if (run >= 2) { hit = true; break } } else run = 0
             }
             if (hit) hits++
         }
@@ -128,19 +153,20 @@ object Ocr {
     }
 
     // ---------- หากรอบคำพูดรอบข้อความ ----------
-    private fun fit(bmp: Bitmap, t: Rect): Fit? {
+    private fun fit(img: Img, t: Rect): Fit? {
         val m = (max(t.width(), t.height()) * 0.8f).toInt().coerceIn(48, 360)
         val cl = max(0, t.left - m); val ct = max(0, t.top - m)
-        val cr = min(bmp.width, t.right + m); val cb = min(bmp.height, t.bottom + m)
+        val cr = min(img.w, t.right + m); val cb = min(img.h, t.bottom + m)
         val w = cr - cl; val h = cb - ct
         val gw = w / ST; val gh = h / ST
         if (gw < 12 || gh < 12) return null
-        val px = IntArray(w * h)
-        bmp.getPixels(px, 0, w, cl, ct, w, h)
         val lum = IntArray(gw * gh)
-        for (y in 0 until gh) for (x in 0 until gw) {
-            val p = px[y * ST * w + x * ST]
-            lum[y * gw + x] = (77 * Color.red(p) + 150 * Color.green(p) + 29 * Color.blue(p)) shr 8
+        for (y in 0 until gh) {
+            val row = (ct + y * ST) * img.w + cl
+            for (x in 0 until gw) {
+                val p = img.px[row + x * ST]
+                lum[y * gw + x] = (77 * Color.red(p) + 150 * Color.green(p) + 29 * Color.blue(p)) shr 8
+            }
         }
         val tl = (t.left - cl) / ST; val tt = (t.top - ct) / ST
         val tr = (t.right - cl) / ST; val tb = (t.bottom - ct) / ST
@@ -170,7 +196,7 @@ object Ocr {
                 if (y > 0 && !seen[c - gw] && abs(lum[c - gw] - ref) <= TOL) { seen[c - gw] = true; q[qt++] = c - gw }
                 if (y < gh - 1 && !seen[c + gw] && abs(lum[c + gw] - ref) <= TOL) { seen[c + gw] = true; q[qt++] = c + gw }
             }
-            if (best == null || area > best[4]) { best = intArrayOf(x0, y0, x1, y1, area); bestColor = px[sy * ST * w + sx * ST] }
+            if (best == null || area > best[4]) { best = intArrayOf(x0, y0, x1, y1, area); bestColor = img.px[(ct + sy * ST) * img.w + cl + sx * ST] }
         }
         val b = best ?: return null
         val sides = (if (b[0] <= 0) 1 else 0) + (if (b[1] <= 0) 1 else 0) + (if (b[2] >= gw - 1) 1 else 0) + (if (b[3] >= gh - 1) 1 else 0)
@@ -187,7 +213,10 @@ object Ocr {
         return Fit(r, Color.rgb(Color.red(bestColor), Color.green(bestColor), Color.blue(bestColor)))
     }
 
-    /** ตัวพิมพ์ใหญ่ล้วนในมังงะ -> sentence case ให้ Google แปลแม่นขึ้น */
+    /**
+     * ตัวพิมพ์ใหญ่ล้วนในมังงะ -> sentence case ให้ Google แปลแม่นขึ้น
+     * คำที่ไม่อยู่ในพจนานุกรมและไม่ใช่คำพื้นฐาน (น่าจะเป็นชื่อคน/สถานที่) จะขึ้นต้นด้วยตัวใหญ่ ไม่งั้นกลางประโยคจะกลายเป็นตัวเล็กแล้วถูกแปลเป็นคำทั่วไป
+     */
     private fun normalize(s: String): String {
         val l = s.filter { it.isLetter() }
         if (l.length < 3 || l.count { it.isUpperCase() } < l.length * 0.8) return s
@@ -196,17 +225,23 @@ object Ocr {
             if (cap && ch.isLetter()) { sb.append(ch.uppercaseChar()); cap = false } else sb.append(ch)
             if (ch == '.' || ch == '!' || ch == '?') cap = true
         }
-        return sb.toString().replace(Regex("\\bi\\b"), "I").replace(Regex("\\bi'"), "I'")
+        var t = sb.toString().replace(Regex("\\bi\\b"), "I").replace(Regex("\\bi'"), "I'")
+        if (Dict.ready()) t = wordRe.replace(t) { m ->
+            val w = m.value; val base = w.substringBefore('\'')
+            if (base.length < 3 || base.lowercase() in stop || w.lowercase() in stop || w[0].isUpperCase() || Dict.lookup(base) != null) w
+            else w.replaceFirstChar { it.uppercaseChar() }
+        }
+        return t
     }
 
     /** สีพื้นกรอบคำพูด (สำรอง): มัธยฐานจากจุด 8 จุดรอบนอกข้อความ */
-    private fun bgOf(bmp: Bitmap, r: Rect): Int {
+    private fun bgOf(img: Img, r: Rect): Int {
         val xs = intArrayOf(r.left - 5, (r.left + r.right) / 2, r.right + 5)
         val ys = intArrayOf(r.top - 5, (r.top + r.bottom) / 2, r.bottom + 5)
         val l = ArrayList<Int>()
         for (xi in 0..2) for (yi in 0..2) {
             if (xi == 1 && yi == 1) continue
-            l.add(bmp.getPixel(xs[xi].coerceIn(0, bmp.width - 1), ys[yi].coerceIn(0, bmp.height - 1)))
+            l.add(img.p(xs[xi], ys[yi]))
         }
         l.sortBy { 77 * Color.red(it) + 150 * Color.green(it) + 29 * Color.blue(it) }
         val p = l[l.size / 2]
@@ -368,17 +403,18 @@ object Translator {
         }
     }
 
-    suspend fun translate(src: List<String>): List<String?> = withContext(Dispatchers.IO) {
+    /** strict = ไม่ใช้พจนานุกรมแปลทีละคำกับประโยคยาว (ได้คำเรียงกันไม่เป็นประโยค) ปล่อยให้เห็นต้นฉบับแทน */
+    suspend fun translate(src: List<String>, strict: Boolean = false): List<String?> = withContext(Dispatchers.IO) {
         val res = HashMap<String, String>()
         val miss = ArrayList<String>()
         for (s in src.distinct()) { val c = cache.get(s); if (c != null) res[s] = c else miss.add(s) }
         if (miss.isNotEmpty()) coroutineScope {
-            miss.chunked(25).map { ch -> async { runChain(ch) } }.awaitAll().forEach { res.putAll(it) }
+            miss.chunked(25).map { ch -> async { runChain(ch, strict) } }.awaitAll().forEach { res.putAll(it) }
         }
         src.map { res[it]?.takeIf { t -> t.isNotBlank() } }
     }
 
-    private suspend fun runChain(chunk: List<String>): Map<String, String> {
+    private suspend fun runChain(chunk: List<String>, strict: Boolean): Map<String, String> {
         val now = System.currentTimeMillis()
         val g = if (now >= googleDownUntil) google(chunk) else emptyMap()
         if (g.isNotEmpty()) { googleFails = 0; setEngine("Google") }
@@ -392,7 +428,7 @@ object Translator {
         if (o.isNotEmpty()) setEngine("ออฟไลน์ (ML Kit)")
         rest = rest.filter { it !in o }
         if (rest.isNotEmpty() && !Dict.ready()) Dict.load(app)
-        val d = rest.associateWith { Dict.translate(it) }
+        val d = rest.filter { !strict || it.split(' ').count { w -> w.isNotBlank() } <= 3 }.associateWith { Dict.translate(it) }
         if (d.values.any { it.isNotBlank() }) setEngine("พจนานุกรม")
         for ((k, v) in g) cache.put(k, v)
         for ((k, v) in o) cache.put(k, v)
@@ -408,24 +444,46 @@ object Translator {
     private suspend fun google(chunk: List<String>): Map<String, String> {
         val out = HashMap<String, String>()
         val pre = chunk.map { Glossary.pre(it) }
-        val joined = callRetry(pre.joinToString("\n"))?.split("\n")
-        if (joined != null && joined.size == chunk.size) chunk.indices.forEach { out[chunk[it]] = Glossary.post(joined[it].trim()) }
-        else if (joined != null) coroutineScope {
+        val arr = callArr(pre.joinToString("\n"))
+        val joined = arr?.let { lines(it) }
+        if (joined != null && joined.size == chunk.size) chunk.indices.forEach { out[chunk[it]] = Glossary.post(joined[it]) }
+        else if (arr != null) coroutineScope {
             chunk.indices.map { i -> async { callRetry(pre[i])?.let { r -> synchronized(out) { out[chunk[i]] = Glossary.post(r.trim()) } } } }.awaitAll()
         }
         return out
     }
 
-    private fun callRetry(q: String): String? { repeat(2) { call(q)?.let { return it } }; return null }
+    private fun seg(j: JSONArray, i: Int, k: Int): String {
+        val a = j.optJSONArray(i) ?: return ""
+        return if (a.isNull(k)) "" else a.optString(k, "")
+    }
 
-    private fun call(q: String): String? {
+    /** จับคู่คำแปลกับบรรทัดต้นฉบับจากข้อความต้นฉบับที่ Google ส่งกลับมาในแต่ละ segment (แม่นกว่านับจำนวนบรรทัด) */
+    private fun lines(j: JSONArray): List<String> {
+        val out = ArrayList<String>(); val cur = StringBuilder()
+        for (i in 0 until j.length()) {
+            cur.append(seg(j, i, 0))
+            if (seg(j, i, 1).endsWith("\n")) { out.add(cur.toString().trim()); cur.setLength(0) }
+        }
+        out.add(cur.toString().trim())
+        return out
+    }
+
+    private fun joinAll(j: JSONArray) = buildString { for (i in 0 until j.length()) append(seg(j, i, 0)) }
+
+    private fun callRetry(q: String): String? = callArr(q)?.let { joinAll(it) }
+
+    private fun callArr(q: String): JSONArray? { repeat(2) { call(q)?.let { return it } }; return null }
+
+    private fun call(q: String): JSONArray? {
         val base = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=th&dt=t&ie=UTF-8&oe=UTF-8"
         val enc = URLEncoder.encode(q, "UTF-8")
         for (post in booleanArrayOf(true, false)) {
+            var c: HttpURLConnection? = null
+            var clean = false
             try {
                 if (!post && enc.length > 3500) continue
-                val c = URL(if (post) base else "$base&q=$enc").openConnection() as HttpURLConnection
-                try {
+                c = URL(if (post) base else "$base&q=$enc").openConnection() as HttpURLConnection
                 c.connectTimeout = 3000; c.readTimeout = 4000
                 c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36")
                 if (post) {
@@ -433,11 +491,12 @@ object Translator {
                     c.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
                     c.outputStream.use { it.write(("q=" + enc).toByteArray()) }
                 }
-                if (c.responseCode != 200) { lastErr = "HTTP ${c.responseCode}"; continue }
-                val j = JSONArray(c.inputStream.bufferedReader().use { it.readText() }).getJSONArray(0)
-                return buildString { for (i in 0 until j.length()) append(j.getJSONArray(i).getString(0)) }
-                } finally { c.disconnect() }
+                if (c.responseCode != 200) { lastErr = "HTTP ${c.responseCode}"; c.errorStream?.close(); clean = true; continue }
+                val body = c.inputStream.bufferedReader().use { it.readText() }
+                clean = true // อ่านจนจบและปิดสตรีมแล้ว: ปล่อยให้ connection กลับเข้า pool เพื่อใช้ซ้ำ (ไม่ต้อง handshake TLS ใหม่)
+                return JSONArray(body).getJSONArray(0)
             } catch (e: Exception) { lastErr = e.javaClass.simpleName }
+            finally { if (!clean) c?.disconnect() }
         }
         return null
     }

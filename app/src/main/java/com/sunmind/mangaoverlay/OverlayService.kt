@@ -201,10 +201,10 @@ class OverlayService : Service() {
             applyTransform(); tracker.reset()
             val bmp = capture!!.snapshot(if (hide) listOf(container) else emptyList(), hide)
             lost = false; container.visibility = View.VISIBLE
-            val items = Ocr.run(bmp, (H * 0.04f).toInt())
+            val found = Ocr.run(bmp, scope, (H * 0.04f).toInt())
             bmp.recycle()
-            if (items.isEmpty()) toast("ไม่พบข้อความในหน้านี้")
-            addItems(items, 1f, 0f, 0f)
+            if (found.items.isEmpty()) toast("ไม่พบข้อความในหน้านี้")
+            addItems(found.items, found.tr, 1f, 0f, 0f)
         } finally { busy = false; ui(false) }
     }
 
@@ -227,20 +227,20 @@ class OverlayService : Service() {
             val bmp = capture!!.snapshot(emptyList(), false)
             val s0 = sc; val x0 = tx; val yy0 = ty
             val crop = Bitmap.createBitmap(bmp, 0, y0, W, y1 - y0)
-            val items = Ocr.run(crop)
+            val found = Ocr.run(crop, scope)
             crop.recycle(); bmp.recycle()
-            items.forEach { it.r.offset(0, y0) }
+            found.items.forEach { it.r.offset(0, y0) }
             accDy -= moved
-            addItems(items.filter { it.r.top >= H * 0.04f }, s0, x0, yy0)
+            addItems(found.items.filter { it.r.top >= H * 0.04f }, found.tr, s0, x0, yy0)
             prune()
         } finally { busy = false; ui(false) }
     }
 
     /** items อยู่ในพิกัดหน้าจอ ณ เวลา snapshot (s0,x0,y0) -> แปลงเป็น local; วางกรอบทันที แล้วเติมข้อความไทยเมื่อแปลเสร็จ */
-    private suspend fun addItems(items: List<Item>, s0: Float, x0: Float, y0: Float) {
+    private suspend fun addItems(items: List<Item>, tr: Deferred<Map<String, String?>>, s0: Float, x0: Float, y0: Float) {
         if (!active || items.isEmpty()) return
         val views = ArrayList<Pair<TextView, Item>>()
-        for (item in items.take(40)) {
+        for (item in items) {
             val r = item.r
             val pd = if (item.bubble) 0 else 6
             val l = (r.left - pd - x0) / s0; val t = (r.top - pd - y0) / s0
@@ -264,10 +264,11 @@ class OverlayService : Service() {
             views.add(Pair(tv, item))
         }
         updateMask()
-        val th = Translator.translate(views.map { it.second.text })
-        views.forEachIndexed { i, (tv, _) ->
-            val s = th[i]
-            if (s == null) container.removeView(tv) else tv.text = s // แปลไม่ได้ -> เอากรอบออก ให้เห็นต้นฉบับ
+        // คำแปลเริ่มทำงานตั้งแต่ตอนหากรอบ ส่วนใหญ่จึงเสร็จแล้ว/ใกล้เสร็จตอนมาถึงตรงนี้
+        val th = try { tr.await() } catch (e: CancellationException) { throw e } catch (e: Exception) { emptyMap<String, String?>() }
+        for ((tv, item) in views) {
+            val t = th[item.text]
+            if (t.isNullOrBlank()) container.removeView(tv) else tv.text = t // แปลไม่ได้ -> เอากรอบออก ให้เห็นต้นฉบับ
         }
         updateMask()
     }
