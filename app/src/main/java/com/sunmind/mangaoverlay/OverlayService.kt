@@ -62,6 +62,8 @@ class OverlayService : Service() {
     private val frameCb = Choreographer.FrameCallback { t -> frameQueued = false; drawFrame(t) }
     private var settleJob: Job? = null
     private var busyUi = false; private var peeking = false; private var rescanQ = false
+    // ตำแหน่งบนจอ (ณ เฟรมของ OCR ครั้งล่าสุด) ของบล็อกที่ถูกขอบจอตัดอยู่: ขอบบนของบล็อกที่ถูกขอบล่างตัด / ขอบล่างของบล็อกที่ถูกขอบบนตัด (-1 = ไม่มี)
+    private var pendB = -1; private var pendT = -1
     private var menu: LinearLayout? = null; private var menuLp: WLP? = null
     private var lastTap = 0L; private var tapRun: Runnable? = null; private var longFired = false
     private val dimRun = Runnable { if (::btn.isInitialized) btn.animate().alpha(0.55f).setDuration(300).start() }
@@ -269,7 +271,7 @@ class OverlayService : Service() {
         if (!active) peeking = false
         applyAlpha(); refreshBtn(); haptic(); updateNotif()
         capture?.tracking = active
-        if (active) scope.launch { while (busy) delay(50); full() } else { container.removeAllViews(); px = 0f; py = 0f; updateMask() }
+        if (active) scope.launch { while (busy) delay(50); full() } else { container.removeAllViews(); px = 0f; py = 0f; pendB = -1; pendT = -1; updateMask() }
     }
 
     /** สแกนหน้าปัจจุบันใหม่ทันที (ถ้ายังไม่เปิดแปล จะเปิดให้) */
@@ -439,7 +441,7 @@ class OverlayService : Service() {
         try {
             val hide = container.visibility == View.VISIBLE && container.childCount > 0
             if (!hide) container.removeAllViews()
-            tracker.reset()
+            tracker.reset(); pendB = -1; pendT = -1
             // ตั้งต้นท่าที่เฟรมของภาพที่จะ OCR พอดี: ถ้าผู้ใช้เลื่อนหน้าระหว่างรอ OCR/แปล กรอบจะเลื่อนตามไปถูกที่ ไม่เพี้ยน
             val snap = capture!!.snapshot(if (hide) listOf(container) else emptyList(), hide, resetPose = true)
             epoch = snap.pose.epoch
@@ -451,6 +453,7 @@ class OverlayService : Service() {
             val bmp = snap.bmp
             val found = Ocr.run(bmp, scope, (H * 0.04f).toInt())
             bmp.recycle()
+            pendB = found.cutB; pendT = found.cutT
             if (found.items.isEmpty()) toast("ไม่พบข้อความในหน้านี้")
             // กรอบเดิมยังอยู่บนจอจนกว่าคำแปลใหม่จะพร้อม (ส่วนใหญ่มาจากแคช) แล้วสลับทีเดียว
             if (hide) { try { found.tr.await() } catch (e: CancellationException) { throw e } catch (e: Exception) { } }
@@ -488,13 +491,21 @@ class OverlayService : Service() {
             if (ps.epoch != epoch) { snap.bmp.recycle(); return }
             val moved = ps.acc                       // ระยะเลื่อนสะสม ณ เฟรมของภาพนี้พอดี
             val margin = (H * 0.1f).toInt()
-            val y0: Int; val y1: Int
-            if (moved < 0) { y0 = max(0, H + moved.toInt() - margin); y1 = H } else { y0 = 0; y1 = min(H, moved.toInt() + margin) }
+            var y0: Int; var y1: Int
+            // บล็อกที่ OCR ครั้งก่อนเจอแต่ถูกขอบจอตัด: ตำแหน่งตอนนี้ = ตำแหน่งเดิม + ระยะเลื่อน ต้องให้แถบครอบทั้งก้อน
+            // (เดิมใช้ margin คงที่ 10% ของจอ บล็อกที่โผล่เกินนั้นจะถูกขอบแถบตัดซ้ำ -> ไม่ถูกแปล หรือแปลได้ครึ่งเดียว)
+            val pb = if (pendB >= 0) pendB + moved.toInt() else -1
+            val pt = if (pendT >= 0) pendT + moved.toInt() else -1
+            if (moved < 0) { y0 = max(0, H + moved.toInt() - margin); y1 = H; if (pb in 0 until H) y0 = min(y0, max(0, pb - 8)) }
+            else { y0 = 0; y1 = min(H, moved.toInt() + margin); if (pt in 1..H) y1 = max(y1, min(H, pt + 8)) }
             if (y1 - y0 < 48) { snap.bmp.recycle(); return }
             val crop = Bitmap.createBitmap(snap.bmp, 0, y0, W, y1 - y0)
             val found = Ocr.run(crop, scope)
             crop.recycle(); snap.bmp.recycle()
             found.items.forEach { it.r.offset(0, y0) }
+            // ขอบจอจริงเฉพาะด้านที่แถบครอบถึง ; ด้านที่ไม่ได้ครอบ ใช้ตำแหน่งที่เลื่อนตามมา
+            pendB = if (y1 >= H) (if (found.cutB >= 0) y0 + found.cutB else -1) else (if (pb in 0 until H) pb else -1)
+            pendT = if (y0 <= 0) found.cutT else (if (pt in 1..H) pt else -1)
             keeper.subAcc(moved)
             addItems(Found(found.items.filter { it.r.top >= H * 0.04f }, found.tr, found.better), ps.s, ps.tx, ps.ty, false)
             prune()

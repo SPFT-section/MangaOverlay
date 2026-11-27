@@ -31,7 +31,9 @@ import kotlin.coroutines.resumeWithException
 class Item(val r: Rect, val text: String, val bg: Int, val bubble: Boolean = false)
 
 /** items = กรอบที่พร้อมวาง, tr = คำแปล (เริ่มแปลไปพร้อมกับการหากรอบ จึงมักเสร็จก่อน/พร้อมกัน) */
-class Found(val items: List<Item>, val tr: Deferred<Map<String, String?>>, val better: Deferred<Map<String, String>>? = null)
+class Found(val items: List<Item>, val tr: Deferred<Map<String, String?>>, val better: Deferred<Map<String, String>>? = null,
+            /** y ขอบบนของบล็อกที่ขอบล่างภาพตัดอยู่ (-1 = ไม่มี) ; cutT = y ขอบล่างของบล็อกที่ขอบบนภาพตัดอยู่ — พิกัดของภาพที่ OCR */
+            val cutB: Int = -1, val cutT: Int = -1)
 
 /** พิกเซลทั้งภาพอ่านครั้งเดียว (เดิมเรียก getPixel ทีละจุดหลายหมื่นครั้ง) */
 private class Img(val px: IntArray, val w: Int, val h: Int) {
@@ -66,25 +68,34 @@ object Ocr {
                 val w = bmp.width; val h = bmp.height
                 val px = IntArray(w * h); bmp.getPixels(px, 0, w, 0, 0, w, h)
                 val img = Img(px, w, h)
-                val bl = blocks(img, t, minTop).take(40)
+                val cut = intArrayOf(Int.MAX_VALUE, -1)
+                val bl = blocks(img, t, minTop, cut).take(40)
                 val texts = bl.map { normalize(it.text) }
                 // เริ่มแปลทันที ขนานไปกับการหากรอบคำพูด: เครื่องแปลเร็ว (ได้ก่อน) + AI (ถ้าตั้งไว้ ได้ทีหลังแต่ดีกว่า)
                 val d = texts.distinct()
                 val tr = scope.async(Dispatchers.IO) { d.zip(Translator.translate(d)).toMap() }
                 val better = if (Llm.enabled() && d.isNotEmpty()) scope.async(Dispatchers.IO) { Translator.refine(texts) } else null
                 val items = bl.mapIndexed { i, b -> async { toItem(img, b, texts[i]) } }.awaitAll()
-                Found(items, tr, better)
+                Found(items, tr, better, if (cut[0] == Int.MAX_VALUE) -1 else cut[0], cut[1])
             } catch (e: CancellationException) { throw e } catch (e: Exception) { none }
         }
     }
 
-    private fun blocks(img: Img, t: Text, minTop: Int): List<Blk> {
+    private fun blocks(img: Img, t: Text, minTop: Int, cut: IntArray): List<Blk> {
         val raw = ArrayList<Blk>()
         for (b in t.textBlocks) {
             val bb = b.boundingBox ?: continue
             if (bb.top < minTop) continue
             // ข้อความที่ถูกขอบภาพตัด = ได้ครึ่งเดียว แปลแล้วผิด รอให้เลื่อนเข้ามาเต็มกรอบแล้วค่อยแปล
-            if (bb.bottom >= img.h - 2 || bb.top <= 1 || bb.left <= 1 || bb.right >= img.w - 1) continue
+            val cb = bb.bottom >= img.h - 2; val ct = bb.top <= 1
+            if (cb || ct || bb.left <= 1 || bb.right >= img.w - 1) {
+                // จดไว้ให้รอบ OCR ถัดไป (strip) ย้อนขึ้นมาครอบบล็อกนี้ทั้งก้อน ไม่งั้นจะโดนตัดซ้ำที่ขอบแถบแล้วหายไปเลย
+                if (bb.left > 1 && bb.right < img.w - 1) {
+                    if (cb) cut[0] = min(cut[0], bb.top)
+                    if (ct) cut[1] = max(cut[1], bb.bottom)
+                }
+                continue
+            }
             if (b.lines.isNotEmpty() && b.lines.map { it.confidence }.average() < 0.35) continue
             val s = clean(b.text)
             if (junkRe.containsMatchIn(s)) continue // ลายน้ำ/URL
@@ -93,8 +104,8 @@ object Ocr {
         }
         val merged = if (Prefs.merge) merge(img, raw) else raw
         return merged.sortedWith(compareBy({ it.r.top }, { it.r.left })).filter { b ->
-            val letters = b.text.count { it.isLetter() }
-            !(letters < 2 && b.text != "I" && b.text != "A") && !noLetterRe.matches(b.text)
+            val core = b.text.filter { it.isLetter() }   // "I?" "A!" "I..." ต้องไม่ถูกทิ้ง (เดิมเทียบทั้งข้อความกับ "I"/"A" เป๊ะ ๆ)
+            !(core.length < 2 && core != "I" && core != "A") && !noLetterRe.matches(b.text)
         }
     }
 
@@ -108,12 +119,14 @@ object Ocr {
         var s = s0.replace("-\n", "").replace("\n", " ")
             .replace('\u2019', '\'').replace('\u2018', '\'').replace('\u201C', '"').replace('\u201D', '"')
             .replace('|', 'I')
-        s = s.replace(Regex("(?<=[A-Z])0(?=[A-Z])"), "O").replace(Regex("(?<=[A-Z])1(?=[A-Z])"), "I")
+        // 0 -> O: ติดตัวพิมพ์ใหญ่และไม่ใช่ส่วนของเลขหลายหลัก (N0, S0, G0, 0K) เดิมจับเฉพาะ 0 ที่มีตัวใหญ่ทั้งสองข้าง
+        s = s.replace(Regex("(?<=[A-Z])0(?![0-9])|(?<![0-9A-Za-z])0(?=[A-Z])"), "O").replace(Regex("(?<=[A-Z])1(?=[A-Z])"), "I")
         s = s.replace(Regex("(?i)(?<=[a-z])\\s*'\\s*(?=(?:t|s|m|d|ll|re|ve)\\b)"), "'")
         s = s.replace(Regex("\\s+"), " ").trim()
         // ตัวพิมพ์ใหญ่ล้วนในมังงะ: "l" ตัวเล็กที่โผล่กลางคำใหญ่คือ "I" ที่ OCR อ่านผิด (lT'S, WlLL, lNSIDE)
-        val lt = s.filter { it.isLetter() }
-        if (lt.length >= 3 && lt.count { it.isUpperCase() } >= lt.length * 0.7) s = s.replace('l', 'I')
+        // นับเฉพาะตัวอักษรที่ไม่ใช่ "l" (เดิมนับ l เป็นตัวหาร: lT'S = 2/3 < 0.7 จึงไม่ถูกแก้) และต้องมีตัวอื่นอย่างน้อย 2 ตัว กัน "All" -> "AII"
+        val rest = s.filter { it.isLetter() && it != 'l' }
+        if ('l' in s && rest.length >= 2 && rest.count { it.isUpperCase() } >= rest.length * 0.8) s = s.replace('l', 'I')
         return s
     }
 
