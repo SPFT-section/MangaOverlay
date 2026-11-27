@@ -377,7 +377,7 @@ class OverlayService : Service() {
     // ---------- OCR + translate ----------
     private suspend fun full() {
         if (busy) return
-        busy = true; ui(true)
+        busy = true; ui(true); applyAlpha()
         try {
             val hide = container.visibility == View.VISIBLE && container.childCount > 0
             container.removeAllViews()
