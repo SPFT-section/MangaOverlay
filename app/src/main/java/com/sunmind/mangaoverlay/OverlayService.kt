@@ -18,6 +18,7 @@ import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.*
 import android.util.DisplayMetrics
+import android.view.Choreographer
 import android.util.TypedValue
 import android.view.*
 import android.view.WindowManager.LayoutParams as WLP
@@ -53,7 +54,12 @@ class OverlayService : Service() {
     private val keeper = PoseKeeper()
     private var statTotal = 0; private var statDone = 0; private var statAi = false
     private var active = false; private var busy = false; private var lost = false
-    private val restRun = Runnable { px = 0f; py = 0f; if (::container.isInitialized) applyTransform() }
+    // ประวัติท่า (เวลา, tx, ty) ไว้ถดถอยเส้นตรงเพื่อคาดการณ์ท่า ณ เวลาที่กรอบจะขึ้นจอจริง
+    private val hT = LongArray(8); private val hX = FloatArray(8); private val hY = FloatArray(8)
+    private var hN = 0; private var offMin = Long.MAX_VALUE; private var lastS = 1f
+    private var frameQueued = false
+    private var pathSinceLock = 0f; private var lastTx = 0f; private var lastTy = 0f
+    private val frameCb = Choreographer.FrameCallback { t -> frameQueued = false; drawFrame(t) }
     private var settleJob: Job? = null
     private var busyUi = false; private var peeking = false; private var rescanQ = false
     private var menu: LinearLayout? = null; private var menuLp: WLP? = null
@@ -335,15 +341,65 @@ class OverlayService : Service() {
         updateMask()
     }
 
+    private fun histClear() { hN = 0; offMin = Long.MAX_VALUE; lastS = 1f; lastTx = 0f; lastTy = 0f }
+
+    private fun histPush(d: Disp) {
+        val now = System.nanoTime()
+        // ฐานเวลาของ timestamp เฟรมอาจต่างจาก nanoTime: ใช้ส่วนต่างที่น้อยที่สุด (ค่อย ๆ คลาย) แปลงเป็นเวลาในฐาน nanoTime
+        val off = now - d.ts
+        offMin = if (d.ts == 0L) 0L else if (offMin == Long.MAX_VALUE || off < offMin) off else offMin + 50_000L
+        val t = if (d.ts == 0L) now else d.ts + offMin
+        if (hN == hT.size) { for (i in 1 until hN) { hT[i - 1] = hT[i]; hX[i - 1] = hX[i]; hY[i - 1] = hY[i] }; hN-- }
+        hT[hN] = t; hX[hN] = d.pose.tx; hY[hN] = d.pose.ty; hN++
+    }
+
+    /** ท่าที่คาดว่าหน้าจะอยู่ ณ เวลา target: ถดถอยเส้นตรงจากตัวอย่างล่าสุด ~70 ms (ทนเฟรมมาไม่สม่ำเสมอ) */
+    private fun predict(target: Long, now: Long) {
+        if (hN == 0) { px = 0f; py = 0f; return }
+        val tl = hT[hN - 1]
+        var k = hN - 1
+        while (k > 0 && hT[k - 1] >= tl - 70_000_000L && hN - k < 6) k--
+        var vx = 0f; var vy = 0f
+        val n = hN - k
+        if (n >= 2) {
+            var mt = 0.0; var mx = 0.0; var my = 0.0
+            for (i in k until hN) { mt += (hT[i] - tl) / 1e9; mx += hX[i]; my += hY[i] }
+            mt /= n; mx /= n; my /= n
+            var stt = 0.0; var stx = 0.0; var sty = 0.0
+            for (i in k until hN) { val dt = (hT[i] - tl) / 1e9 - mt; stt += dt * dt; stx += dt * (hX[i] - mx); sty += dt * (hY[i] - my) }
+            if (stt > 1e-9) { vx = (stx / stt).toFloat(); vy = (sty / stt).toFloat() }
+        }
+        val age = (now - tl) / 1e9f
+        // ไม่มีเฟรมใหม่มานาน = หน้าหยุด/ช้าลงแล้ว ค่อย ๆ เลิกคาดการณ์ ไม่ให้เลยเป้า
+        val fade = if (age > 0.04f) max(0f, 1f - (age - 0.04f) / 0.08f) else 1f
+        val h = ((target - tl) / 1e9f).coerceIn(0f, 0.07f)
+        px = vx * fade * h; py = vy * fade * h
+        if (abs(px) < 0.4f && abs(py) < 0.4f) { px = 0f; py = 0f }
+    }
+
+    private fun drawFrame(frameNs: Long) {
+        if (!::container.isInitialized || !active) return
+        val target = frameNs + Prefs.lead * 1_000_000L
+        predict(target, frameNs)
+        applyTransform()
+        // ยังมีเฟรมใหม่เข้ามาไม่นาน = วาดต่อทุก vsync (ท่าลื่นตามจอ ไม่กระตุกตามจังหวะเฟรมที่จับภาพ)
+        if (hN > 0 && frameNs - hT[hN - 1] < 160_000_000L) queueFrame()
+    }
+
+    private fun queueFrame() {
+        if (frameQueued) return
+        frameQueued = true
+        Choreographer.getInstance().postFrameCallback(frameCb)
+    }
+
     private fun applyStep(d: Disp) {
         if (!active || d.pose.epoch != epoch) return   // ผลที่ตกค้างจากก่อนสแกนใหม่ ทิ้งไป
         val p = d.pose
+        pathSinceLock += abs(p.tx - lastTx) + abs(p.ty - lastTy); lastTx = p.tx; lastTy = p.ty
         sc = p.s; tx = p.tx; ty = p.ty
-        // ชดเชยความหน่วง ~2-3 เฟรมระหว่างจับภาพ->คำนวณ->วาด ด้วยการคาดการณ์ตามความเร็วล่าสุด (จำกัดไม่ให้เกินจริง)
-        val lead = 30f
-        px = (d.vx * lead).coerceIn(-45f, 45f); py = (d.vy * lead).coerceIn(-45f, 45f)
-        if (!d.ok || d.still || abs(px) < 0.5f && abs(py) < 0.5f) { px = 0f; py = 0f }
-        main.removeCallbacks(restRun); main.postDelayed(restRun, 90)   // หยุดเลื่อน = คืนตำแหน่งจริง ไม่ค้างค่าคาดการณ์
+        // ตามไม่ได้ชั่วคราว: ไม่เพิ่มตัวอย่าง (ท่าคงเดิม) ; ตามได้: เก็บตัวอย่างแล้วให้ drawFrame คาดการณ์ทุก vsync
+        if (d.ok) histPush(d)
+        if (abs(sc - lastS) > 0.002f) { hN = 0; lastS = sc; px = 0f; py = 0f }   // ซูม: ไม่คาดการณ์
         if (container.childCount == 0) {
             // หน้าแรกไม่พบข้อความ: พอเลื่อนไปหน้าที่มีข้อความแล้วหยุดนิ่ง ต้องสแกนใหม่เอง
             if (d.moved) {
@@ -355,7 +411,7 @@ class OverlayService : Service() {
         // ตามไม่ได้ชั่วคราวไม่ซ่อนกรอบ (เดิมซ่อนทันทีแล้วสแกนใหม่ทั้งหน้า = กระพริบ) จะซ่อนก็ต่อเมื่อหลงตำแหน่งจริง
         if (d.lost) { lost = true; container.visibility = View.INVISIBLE }
         else if (container.visibility != View.VISIBLE && !lost) container.visibility = View.VISIBLE
-        applyTransform()
+        if (d.still) { px = 0f; py = 0f; hN = 0; applyTransform() } else { predict(System.nanoTime() + Prefs.lead * 1_000_000L, System.nanoTime()); applyTransform(); queueFrame() }
         if (!lost && !busy && abs(p.acc) > H * 0.25f && abs(sc - 1f) <= 0.03f) scope.launch { strip() }
         settleJob?.cancel()
         settleJob = scope.launch { delay(150); scope.launch { onSettle() } }
@@ -365,8 +421,10 @@ class OverlayService : Service() {
         val l = ArrayList<Rect>()
         for (i in 0 until container.childCount) {
             val p = container.getChildAt(i).layoutParams as FrameLayout.LayoutParams
-            l.add(Rect((p.leftMargin * sc + tx).toInt() - 8, (p.topMargin * sc + ty).toInt() - 8,
-                ((p.leftMargin + p.width) * sc + tx).toInt() + 8, ((p.topMargin + p.height) * sc + ty).toInt() + 8))
+            // กรอบในเฟรมที่จับภาพอยู่ล้าหลังตำแหน่งปัจจุบันราว px/py: ขยายหน้ากากครอบช่วงนั้นด้วย (ไม่ให้ขอบกรอบถูกนับเป็นจุดติดตาม)
+            val ex = 8 + abs(px).toInt(); val ey = 8 + abs(py).toInt()
+            l.add(Rect((p.leftMargin * sc + tx + px).toInt() - ex, (p.topMargin * sc + ty + py).toInt() - ey,
+                ((p.leftMargin + p.width) * sc + tx + px).toInt() + ex, ((p.topMargin + p.height) * sc + ty + py).toInt() + ey))
         }
         btnLp?.let { l.add(Rect(it.x - 8, it.y - 8, it.x + it.width + 8, it.y + it.height + 8)) }
         val m = menu; val ml = menuLp
@@ -380,25 +438,43 @@ class OverlayService : Service() {
         busy = true; ui(true); applyAlpha()
         try {
             val hide = container.visibility == View.VISIBLE && container.childCount > 0
-            container.removeAllViews()
+            if (!hide) container.removeAllViews()
             tracker.reset()
             // ตั้งต้นท่าที่เฟรมของภาพที่จะ OCR พอดี: ถ้าผู้ใช้เลื่อนหน้าระหว่างรอ OCR/แปล กรอบจะเลื่อนตามไปถูกที่ ไม่เพี้ยน
             val snap = capture!!.snapshot(if (hide) listOf(container) else emptyList(), hide, resetPose = true)
-            epoch = snap.pose.epoch; sc = 1f; tx = 0f; ty = 0f; px = 0f; py = 0f
+            epoch = snap.pose.epoch
+            if (hide) rebase()   // กรอบเดิมคงอยู่บนจอระหว่าง OCR (ย้ายพิกัดมาอยู่ในท่าตั้งต้นใหม่) แล้วค่อยสลับเมื่อได้กรอบใหม่ ไม่กระพริบ
+            sc = 1f; tx = 0f; ty = 0f; px = 0f; py = 0f
+            histClear(); pathSinceLock = 0f
             lost = false; container.visibility = View.VISIBLE
             applyTransform()
             val bmp = snap.bmp
             val found = Ocr.run(bmp, scope, (H * 0.04f).toInt())
             bmp.recycle()
             if (found.items.isEmpty()) toast("ไม่พบข้อความในหน้านี้")
+            // กรอบเดิมยังอยู่บนจอจนกว่าคำแปลใหม่จะพร้อม (ส่วนใหญ่มาจากแคช) แล้วสลับทีเดียว
+            if (hide) { try { found.tr.await() } catch (e: CancellationException) { throw e } catch (e: Exception) { } }
+            container.removeAllViews()
             addItems(found, 1f, 0f, 0f, true)
         } finally { busy = false; ui(false) }
+    }
+
+    /** แปลงพิกัดกรอบเดิมให้เป็นพิกัดหน้าจอ ณ ตอนนี้ (scale/translate ของ container -> 1/0) โดยกรอบไม่ขยับบนจอ */
+    private fun rebase() {
+        for (i in 0 until container.childCount) {
+            val v = container.getChildAt(i); val p = v.layoutParams as FrameLayout.LayoutParams
+            val l = p.leftMargin * sc + tx; val t = p.topMargin * sc + ty
+            p.width = max(1, (p.width * sc).toInt()); p.height = max(1, (p.height * sc).toInt())
+            p.leftMargin = l.toInt(); p.topMargin = t.toInt()
+            v.layoutParams = p
+        }
     }
 
     private suspend fun onSettle() {
         if (!active) return
         if (busy) { settleJob = scope.launch { delay(250); onSettle() }; return }
-        if (lost || abs(sc - 1f) > 0.03f) { full(); return }
+        // ติดตามมาไกลแล้ว (>1.2 จอ) = ตำแหน่งอาจคลาดสะสม: สแกนใหม่เพื่อล็อกกรอบเข้ากับข้อความจริง
+        if (lost || abs(sc - 1f) > 0.03f || pathSinceLock > H * 1.2f) { full(); return }
         if (abs(keeper.now().acc) >= H * 0.06f) strip() else prune()
     }
 

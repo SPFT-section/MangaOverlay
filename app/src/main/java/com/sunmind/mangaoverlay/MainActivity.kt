@@ -194,6 +194,7 @@ class MainActivity : Activity() {
             addView(toggleRow("สั่นเมื่อแตะปุ่มลอย", "ให้ฟีดแบ็กตอนแตะ แตะสองครั้ง และกดค้าง", Prefs.haptic) { Prefs.haptic = it })
             addView(seekRow("ความทึบของกล่องคำแปล", 40, 100, Prefs.opacity, { "$it%" }) { Prefs.opacity = it })
             addView(seekRow("ขนาดตัวอักษรสูงสุด", 16, 40, Prefs.maxSp, { "$it sp" }) { Prefs.maxSp = it })
+            addView(seekRow("ชดเชยความหน่วงตอนเลื่อน", 0, 120, Prefs.lead, { "$it ms" }) { Prefs.lead = it })
         }
 
         val glossary = card {

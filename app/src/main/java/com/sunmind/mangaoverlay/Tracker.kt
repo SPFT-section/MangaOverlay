@@ -130,7 +130,7 @@ class Tracker(private val sw: Int, private val sh: Int) {
 class Pose(val s: Float, val tx: Float, val ty: Float, val acc: Float, val epoch: Int)
 
 /** ข้อมูลที่ส่งให้ UI ต่อหนึ่งเฟรม: ท่าที่แน่นอน + ความเร็ว (พิกเซล/มิลลิวินาที) สำหรับชดเชยความหน่วง */
-class Disp(val pose: Pose, val vx: Float, val vy: Float, val ok: Boolean, val still: Boolean, val lost: Boolean, val moved: Boolean)
+class Disp(val pose: Pose, val vx: Float, val vy: Float, val ok: Boolean, val still: Boolean, val lost: Boolean, val moved: Boolean, val ts: Long = 0L)
 
 /**
  * เก็บท่าสะสมบน thread ของ Capture (ทุกเฟรมนับครบ ไม่ขึ้นกับว่า UI ว่างหรือไม่) แล้วให้ snapshot อ่านท่า "ของเฟรมนั้นพอดี"
@@ -173,6 +173,6 @@ class PoseKeeper {
             if ((ts - failSince) / 1_000_000L > 350) lost = true
         }
         tLast = ts
-        return Disp(Pose(s, tx, ty, acc, epoch), vx, vy, st.ok, st.still, lost, moved)
+        return Disp(Pose(s, tx, ty, acc, epoch), vx, vy, st.ok, st.still, lost, moved, ts)
     }
 }

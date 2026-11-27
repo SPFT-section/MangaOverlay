@@ -32,6 +32,11 @@ object Prefs {
         get() = sp.getInt("opacity", 100).coerceIn(40, 100)
         set(v) { sp.edit().putInt("opacity", v.coerceIn(40, 100)).apply() }
 
+    /** ชดเชยความหน่วงของกรอบตอนเลื่อน 0-120 ms (มากไป = กรอบวิ่งนำหน้า น้อยไป = กรอบตามหลัง) */
+    var lead: Int
+        get() = if (::sp.isInitialized) sp.getInt("lead", 50).coerceIn(0, 120) else 50
+        set(v) { sp.edit().putInt("lead", v.coerceIn(0, 120)).apply() }
+
     /** ขนาดตัวอักษรสูงสุดของคำแปล (sp) */
     var maxSp: Int
         get() = sp.getInt("maxsp", 28).coerceIn(16, 40)
