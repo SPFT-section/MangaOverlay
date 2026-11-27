@@ -14,6 +14,8 @@ import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
 import android.service.quicksettings.TileService
 import android.text.Layout
+import android.text.StaticLayout
+import android.text.TextPaint
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.*
@@ -26,7 +28,6 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
-import androidx.core.widget.TextViewCompat
 import kotlinx.coroutines.*
 import org.opencv.android.OpenCVLoader
 import kotlin.math.abs
@@ -177,7 +178,7 @@ class OverlayService : Service() {
         layer = FrameLayout(this).apply { clipChildren = false }
         layer.addView(container, FrameLayout.LayoutParams(-1, -1))
         val lp = WLP(-1, -1, WLP.TYPE_APPLICATION_OVERLAY,
-            WLP.FLAG_NOT_TOUCHABLE or WLP.FLAG_NOT_FOCUSABLE or WLP.FLAG_LAYOUT_IN_SCREEN or WLP.FLAG_LAYOUT_NO_LIMITS,
+            WLP.FLAG_NOT_TOUCHABLE or WLP.FLAG_NOT_FOCUSABLE or WLP.FLAG_LAYOUT_IN_SCREEN or WLP.FLAG_LAYOUT_NO_LIMITS or WLP.FLAG_HARDWARE_ACCELERATED,
             PixelFormat.TRANSLUCENT).apply {
             gravity = Gravity.TOP or Gravity.START
             if (Build.VERSION.SDK_INT >= 28) layoutInDisplayCutoutMode = WLP.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
@@ -457,15 +458,17 @@ class OverlayService : Service() {
             if (found.items.isEmpty()) toast("ไม่พบข้อความในหน้านี้")
             // กรอบเดิมยังอยู่บนจอจนกว่าคำแปลใหม่จะพร้อม (ส่วนใหญ่มาจากแคช) แล้วสลับทีเดียว
             if (hide) { try { found.tr.await() } catch (e: CancellationException) { throw e } catch (e: Exception) { } }
-            container.removeAllViews()
-            addItems(found, 1f, 0f, 0f, true)
+            val old = List(container.childCount) { container.getChildAt(it) }
+            addItems(found, 1f, 0f, 0f, true, old)
         } finally { busy = false; ui(false) }
     }
 
     /** แปลงพิกัดกรอบเดิมให้เป็นพิกัดหน้าจอ ณ ตอนนี้ (scale/translate ของ container -> 1/0) โดยกรอบไม่ขยับบนจอ */
     private fun rebase() {
+        if (sc == 1f && tx == 0f && ty == 0f) return
         for (i in 0 until container.childCount) {
             val v = container.getChildAt(i); val p = v.layoutParams as FrameLayout.LayoutParams
+            if (sc != 1f && v is TextView && v.textSize > 0f) v.setTextSize(TypedValue.COMPLEX_UNIT_PX, v.textSize * sc)
             val l = p.leftMargin * sc + tx; val t = p.topMargin * sc + ty
             p.width = max(1, (p.width * sc).toInt()); p.height = max(1, (p.height * sc).toInt())
             p.leftMargin = l.toInt(); p.topMargin = t.toInt()
@@ -513,10 +516,10 @@ class OverlayService : Service() {
     }
 
     /** items อยู่ในพิกัดหน้าจอ ณ เวลา snapshot (s0,x0,y0) -> แปลงเป็น local; วางกรอบทันที แล้วเติมข้อความไทยเมื่อแปลเสร็จ */
-    private suspend fun addItems(f: Found, s0: Float, x0: Float, y0: Float, whole: Boolean) {
+    private suspend fun addItems(f: Found, s0: Float, x0: Float, y0: Float, whole: Boolean, replace: List<View>? = null) {
         val items = f.items
         if (whole) { statTotal = 0; statDone = 0; statAi = false }
-        if (!active || items.isEmpty()) return
+        if (!active || items.isEmpty()) { replace?.forEach { container.removeView(it) }; return }
         val views = ArrayList<Pair<TextView, Item>>()
         for (item in items) {
             val r = item.r
@@ -526,7 +529,9 @@ class OverlayService : Service() {
             val nr = RectF(l, t, l + w, t + h)
             var skip = false
             for (j in container.childCount - 1 downTo 0) {
-                val p = container.getChildAt(j).layoutParams as FrameLayout.LayoutParams
+                val cv = container.getChildAt(j)
+                if (replace != null && replace.contains(cv)) continue   // กรอบเก่าที่กำลังจะถูกสลับออก ไม่นับเป็นตัวซ้อน
+                val p = cv.layoutParams as FrameLayout.LayoutParams
                 val er = RectF(p.leftMargin.toFloat(), p.topMargin.toFloat(), (p.leftMargin + p.width).toFloat(), (p.topMargin + p.height).toFloat())
                 val ix = RectF(er)
                 if (ix.intersect(nr)) {
@@ -547,10 +552,16 @@ class OverlayService : Service() {
         // คำแปลเริ่มทำงานตั้งแต่ตอนหากรอบ ส่วนใหญ่จึงเสร็จแล้ว/ใกล้เสร็จตอนมาถึงตรงนี้
         val th = try { f.tr.await() } catch (e: CancellationException) { throw e } catch (e: Exception) { emptyMap<String, String?>() }
         val missing = ArrayList<Pair<TextView, Item>>()
+        val ready = ArrayList<Pair<TextView, String>>()
         for ((tv, item) in views) {
             val t = th[item.text]
-            if (t.isNullOrBlank()) missing.add(Pair(tv, item)) else { tv.text = t; tv.visibility = View.VISIBLE; statDone++ }
+            if (t.isNullOrBlank()) missing.add(Pair(tv, item)) else ready.add(Pair(tv, t))
         }
+        // คำนวณขนาดตัวอักษรทุกกรอบพร้อมกันนอก main thread แล้ววางทีเดียว (เดิม autosize วัดซ้ำบน main thread ทำให้เฟรมตกตอนเลื่อน)
+        val shown = coroutineScope { ready.map { (tv, t) -> async { place(tv, t) } }.awaitAll() }
+        statDone += shown.count { it }
+        // สลับกรอบเก่าออกในเฟรมเดียวกับที่กรอบใหม่ขึ้น ไม่มีช่วงว่างให้เห็นต้นฉบับกะพริบ
+        replace?.forEach { container.removeView(it) }
         updateMask()
         // งานที่ไม่ควรค้าง busy: ลองกรอบที่แปลไม่ได้ซ้ำ + รอคำแปลจาก AI (ช้ากว่าแต่ดีกว่า) แล้วแทนที่
         scope.launch {
@@ -558,20 +569,16 @@ class OverlayService : Service() {
                 delay(1200)
                 val again = Translator.translate(missing.map { it.second.text }.distinct(), strict = false, force = true)
                 val map = missing.map { it.second.text }.distinct().zip(again).toMap()
-                for ((tv, item) in missing) {
-                    val t = map[item.text]
-                    if (!t.isNullOrBlank() && tv.parent === container) { tv.text = t; tv.visibility = View.VISIBLE; statDone++ }
-                }
+                val fill = missing.mapNotNull { (tv, item) -> map[item.text]?.takeIf { it.isNotBlank() }?.let { Pair(tv, it) } }
+                val got = coroutineScope { fill.map { (tv, t) -> async { place(tv, t) } }.awaitAll() }
+                statDone += got.count { it }
             }
             val bm = f.better?.let { try { it.await() } catch (e: CancellationException) { throw e } catch (e: Exception) { null } }
             if (bm != null && bm.isNotEmpty()) {
                 statAi = true
-                for ((tv, item) in views) {
-                    val t = bm[item.text] ?: continue
-                    if (tv.parent !== container) continue
-                    if (tv.visibility != View.VISIBLE) statDone++
-                    tv.text = t; tv.visibility = View.VISIBLE
-                }
+                val upd = views.mapNotNull { (tv, item) -> bm[item.text]?.let { Pair(tv, it) } }
+                val got = coroutineScope { upd.map { (tv, t) -> async { place(tv, t) } }.awaitAll() }
+                statDone += got.count { it }
             }
             // ยังไม่มีคำแปลจริง ๆ -> เอากรอบออกให้เห็นต้นฉบับ
             for ((tv, _) in views) if (tv.parent === container && tv.visibility != View.VISIBLE) container.removeView(tv)
@@ -584,6 +591,46 @@ class OverlayService : Service() {
         toast("แปลแล้ว $statDone/$statTotal กรอบ ($pct%) • ตัวแปล: ${if (statAi) "AI + " else ""}${Translator.engine().ifEmpty { "-" }}")
     }
 
+    /** ขนาดตัวอักษร (px) ใหญ่ที่สุดที่ข้อความพอดีกรอบ w×h — ทำบน thread พื้นหลัง ไม่แตะ View */
+    private fun fitPx(text: String, w: Int, h: Int, bold: Boolean, lo0: Float, hi0: Float): Float {
+        val aw = max(1, w - 8); val ah = max(1, h - 4)   // หัก padding (4,2,4,2) ของ makeTv
+        val p = TextPaint(Paint.ANTI_ALIAS_FLAG)
+        if (bold) p.typeface = Typeface.DEFAULT_BOLD
+        fun fits(s: Float): Boolean {
+            p.textSize = s
+            val l = StaticLayout.Builder.obtain(text, 0, text.length, p, aw)
+                .setAlignment(Layout.Alignment.ALIGN_CENTER)
+                .setBreakStrategy(Layout.BREAK_STRATEGY_BALANCED)
+                .setHyphenationFrequency(Layout.HYPHENATION_FREQUENCY_NONE)
+                .build()
+            return l.height <= ah
+        }
+        if (fits(hi0)) return hi0
+        if (!fits(lo0)) return lo0
+        var lo = lo0; var hi = hi0
+        while (hi - lo > 0.75f) { val m = (lo + hi) / 2f; if (fits(m)) lo = m else hi = m }
+        return lo
+    }
+
+    /** ใส่คำแปลลงกรอบ: คำนวณขนาดนอก main thread แล้วค่อยตั้งค่า + fade-in นุ่ม ๆ ; คืน true ถ้ากรอบนี้เพิ่งถูกแสดงครั้งแรก */
+    private suspend fun place(tv: TextView, text: String): Boolean {
+        if (tv.parent !== container) return false
+        val shown = tv.visibility == View.VISIBLE
+        if (shown && tv.text.toString() == text) return false
+        val lp = tv.layoutParams; val w = lp.width; val h = lp.height; val bold = Prefs.bold
+        val dm = resources.displayMetrics
+        val lo = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, 7f, dm)
+        val hi = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, Prefs.maxSp.toFloat(), dm)
+        val px = withContext(Dispatchers.Default) { fitPx(text, w, h, bold, lo, hi) }
+        if (tv.parent !== container) return false
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_PX, px)
+        tv.text = text
+        if (shown) return false
+        tv.alpha = 0f; tv.visibility = View.VISIBLE
+        tv.animate().alpha(1f).setDuration(160).start()
+        return true
+    }
+
     private fun makeTv(bg: Int) = TextView(this).apply {
         gravity = Gravity.CENTER; setPadding(4, 2, 4, 2)
         val lum = 0.299 * Color.red(bg) + 0.587 * Color.green(bg) + 0.114 * Color.blue(bg)
@@ -592,7 +639,7 @@ class OverlayService : Service() {
         breakStrategy = Layout.BREAK_STRATEGY_BALANCED       // ตัดบรรทัดให้สมดุลเหมือนในกรอบคำพูด
         hyphenationFrequency = Layout.HYPHENATION_FREQUENCY_NONE
         if (Prefs.bold) typeface = Typeface.DEFAULT_BOLD
-        TextViewCompat.setAutoSizeTextTypeUniformWithConfiguration(this, 7, Prefs.maxSp, 1, TypedValue.COMPLEX_UNIT_SP)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)   // ขนาดจริงคำนวณใน place()
     }
 
     private fun prune() {
