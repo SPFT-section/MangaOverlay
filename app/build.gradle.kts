@@ -4,7 +4,7 @@ android {
     compileSdk = 35
     defaultConfig {
         applicationId = "com.sunmind.mangaoverlay"
-        minSdk = 26; targetSdk = 34; versionCode = 10; versionName = "3.7"
+        minSdk = 26; targetSdk = 34; versionCode = 11; versionName = "3.8"
         ndk { abiFilters += "arm64-v8a" }
     }
     // keystore คงที่ ทำให้ APK จากทุก build ลงทับกันได้ (ไม่ต้องถอนการติดตั้งก่อน)
@@ -22,6 +22,7 @@ dependencies {
     implementation("com.google.mlkit:text-recognition:16.0.1")
     implementation("com.google.mlkit:translate:17.0.3")
     implementation("org.opencv:opencv:4.9.0")
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.19.2")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("androidx.core:core-ktx:1.15.0")
 }

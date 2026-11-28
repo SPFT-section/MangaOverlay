@@ -42,6 +42,16 @@ object Prefs {
         get() = sp.getInt("maxsp", 28).coerceIn(16, 40)
         set(v) { sp.edit().putInt("maxsp", v.coerceIn(16, 40)).apply() }
 
+    /** ใช้โมเดล OCR (PP-OCR จาก Hugging Face) ช่วยอ่านกรอบที่ ML Kit ไม่มั่นใจ */
+    var useModel: Boolean
+        get() = sp.getBoolean("usemodel", true)
+        set(v) { sp.edit().putBoolean("usemodel", v).apply() }
+
+    /** URL ไฟล์ .onnx ของโมเดลอ่านตัวอักษร (ว่าง = ค่าเริ่มต้นใน PpRec) */
+    var modelUrl: String
+        get() = sp.getString("modelurl", "") ?: ""
+        set(v) { sp.edit().putString("modelurl", v.trim()).apply() }
+
     var glossary: String
         get() = if (::sp.isInitialized) sp.getString("glossary", "") ?: "" else ""
         set(v) { sp.edit().putString("glossary", v).apply() }

@@ -55,7 +55,7 @@ object Ocr {
         "such own same other another few little lot lots now let get got go going gonna wanna gotta kinda dunno gotcha lemme gimme ya yo huh heh haha ahh ohh ugh argh " +
         "okay ok yeah yep nope please thanks thank sorry dont doesnt didnt isnt arent wasnt werent wont cant couldnt shouldnt wouldnt").split(' ').toHashSet()
 
-    private class Blk(val r: Rect, val text: String, val lh: Int, val conf: Float = 1f)
+    private class Blk(val r: Rect, val text: String, val lh: Int, val conf: Float = 1f, val lines: List<Rect> = emptyList())
     private class Fit(val r: Rect, val bg: Int)
 
     suspend fun run(bmp: Bitmap, scope: CoroutineScope, minTop: Int = 0): Found {
@@ -100,7 +100,8 @@ object Ocr {
             val s = clean(b.text)
             if (junkRe.containsMatchIn(s)) continue // ลายน้ำ/URL
             val hs = b.lines.mapNotNull { it.boundingBox?.height() }.sorted()
-            raw.add(Blk(Rect(bb), s, if (hs.isEmpty()) bb.height() else hs[hs.size / 2], if (b.lines.isEmpty()) 1f else b.lines.map { it.confidence }.average().toFloat()))
+            raw.add(Blk(Rect(bb), s, if (hs.isEmpty()) bb.height() else hs[hs.size / 2], if (b.lines.isEmpty()) 1f else b.lines.map { it.confidence }.average().toFloat(),
+                b.lines.mapNotNull { it.boundingBox }.map { Rect(it) }))
         }
         val merged = if (Prefs.merge) merge(img, raw) else raw
         return merged.sortedWith(compareBy({ it.r.top }, { it.r.left })).filter { b ->
@@ -124,7 +125,7 @@ object Ocr {
         return 1f - min(1f, Spell.cost(x, y, m.toFloat()) / m)
     }
 
-    private class Cand(val text: String, val conf: Float)
+    private class Cand(val text: String, val conf: Float, val model: Boolean = false)
 
     private fun crop(src: Bitmap, r: Rect): Triple<IntArray, Int, Int>? {
         val x0 = max(0, r.left - 6); val y0 = max(0, r.top - 6); val x1 = min(src.width, r.right + 6); val y1 = min(src.height, r.bottom + 6)
@@ -147,7 +148,16 @@ object Ocr {
             budget--
             val cr = crop(bmp, b.r)
             val cands = arrayListOf(Cand(b.text, b.conf))
-            if (cr != null) {
+            // โมเดล PP-OCR อ่านทีละบรรทัด (ใช้กรอบบรรทัดจาก ML Kit) : แม่นกับฟอนต์แคบ/เอฟเฟกต์ที่ ML Kit อ่านเป็นขยะ
+            if (Prefs.useModel && PpRec.ready() && b.lines.isNotEmpty()) {
+                val rs = b.lines.sortedBy { it.top }.map { PpRec.recognize(bmp, it) }
+                if (rs.all { it != null }) {
+                    val s = clean(rs.joinToString(" ") { it!!.first })
+                    if (s.isNotBlank() && !junkRe.containsMatchIn(s)) cands.add(Cand(s, rs.map { it!!.second }.average().toFloat(), true))
+                }
+            }
+            val modelGood = cands.any { it.model && it.conf >= 0.85f && score(it.text) >= 0.8f }
+            if (cr != null && !modelGood) {
                 val sc = (96f / max(cr.third, 1)).toInt().coerceIn(2, 4)   // ให้ตัวอักษรสูงราว 100px+ ซึ่งเป็นช่วงที่ OCR อ่านดีที่สุด
                 for (v in Bin.variants(cr.first, cr.second, cr.third, sc)) {
                     val pb = try { Bitmap.createBitmap(v.px, v.w, v.h, Bitmap.Config.ARGB_8888) } catch (e: Exception) { continue }
@@ -165,9 +175,9 @@ object Ocr {
             }
             val best = cands.maxByOrNull { c ->
                 val agree = if (cands.size > 1) cands.filter { it !== c }.map { sim(c.text, it.text) }.average().toFloat() else 0f
-                score(c.text) + 0.5f * c.conf + 0.5f * agree
+                score(c.text) + 0.5f * c.conf + 0.5f * agree + (if (c.model && c.conf >= 0.8f) 0.2f else 0f)
             }!!
-            out.add(Blk(b.r, spellFix(best.text), b.lh, best.conf))
+            out.add(Blk(b.r, spellFix(best.text), b.lh, best.conf, b.lines))
         }
         // ยังเป็นขยะหลังอ่านซ้ำ (หลายคำ ไม่ใช่คำจริงเป็นส่วนใหญ่ มั่นใจต่ำ) = ไม่แปล ดีกว่าแสดงคำแปลมั่ว
         return out.filter { b -> !(Dict.ready() && wordRe.findAll(b.text).count() >= 3 && score(b.text) < 0.4f && b.conf < 0.75f) }
@@ -209,7 +219,7 @@ object Ocr {
             val m = g.map { a[it] }.sortedBy { it.r.top }
             val r = Rect(m[0].r)
             m.forEach { r.union(it.r) }
-            Blk(r, m.joinToString(" ") { it.text }, m.map { it.lh }.sorted()[m.size / 2], m.minOf { it.conf })
+            Blk(r, m.joinToString(" ") { it.text }, m.map { it.lh }.sorted()[m.size / 2], m.minOf { it.conf }, m.flatMap { it.lines }.sortedBy { it.top })
         }
     }
 
@@ -533,6 +543,7 @@ object Translator {
         onStatus = null
         saveDisk()
         client?.close(); client = null; offlineReady = false
+        PpRec.close()
     }
     private fun status(m: String) { onStatus?.invoke(m) }
     private fun setEngine(e: String) { if (e != lastEngine) { lastEngine = e; status("แปลด้วย: $e") } }
@@ -540,6 +551,7 @@ object Translator {
 
     suspend fun warmUp() = coroutineScope {
         launch(Dispatchers.IO) { Dict.load(app) }
+        launch(Dispatchers.IO) { if (Prefs.useModel) PpRec.load(app) }
         launch(Dispatchers.IO) { callRetry("hi") }
         launch(Dispatchers.IO) { edgeToken(false) }
         launch {

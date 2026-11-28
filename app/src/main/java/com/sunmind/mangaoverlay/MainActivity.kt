@@ -56,6 +56,8 @@ class MainActivity : Activity() {
     private lateinit var llmModelBox: EditText
     private lateinit var llmBaseBox: EditText
     private lateinit var llmOut: TextView
+    private lateinit var modelOut: TextView
+    private lateinit var modelUrlBox: EditText
     private lateinit var provChips: List<TextView>
     private val provNames = listOf("ปิด", "Gemini", "OpenAI-compat", "Claude")
 
@@ -197,6 +199,18 @@ class MainActivity : Activity() {
             addView(seekRow("ชดเชยความหน่วงตอนเลื่อน", 0, 120, Prefs.lead, { "$it ms" }) { Prefs.lead = it })
         }
 
+        modelUrlBox = field(EditText(this).apply { hint = "URL โมเดล .onnx (เว้นว่าง = ค่าเริ่มต้น)"; setSingleLine(); setText(Prefs.modelUrl) })
+        modelOut = tv("", 13f, TXT).apply { setPadding(0, dp(8), 0, 0) }
+        refreshModel()
+        val modelCard = card {
+            addView(section("โมเดลอ่านตัวอักษร (โหลดจาก Hugging Face)"))
+            addView(tv("โหลดครั้งเดียว ~11 MB (PP-OCRv4 ONNX) แล้วรันในเครื่อง ช่วยอ่านฟอนต์แคบ/เอฟเฟกต์ที่ ML Kit อ่านเพี้ยน ใช้กับกรอบที่ OCR ปกติไม่มั่นใจเท่านั้น หลังโหลดเสร็จให้หยุดแล้วเริ่มบริการใหม่", 12f, SUB).apply { setLineSpacing(0f, 1.15f) })
+            addView(toggleRow("ใช้โมเดลช่วยอ่าน", "อ่านซ้ำเฉพาะกรอบที่ไม่มั่นใจ", Prefs.useModel) { Prefs.useModel = it })
+            addView(modelUrlBox, lp(8))
+            addView(button("โหลดโมเดล", 0xFF374151.toInt()) { downloadModel() }, lp(10))
+            addView(modelOut)
+        }
+
         val glossary = card {
             addView(section("ศัพท์เฉพาะ / ชื่อตัวละคร"))
             addView(gl)
@@ -246,7 +260,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(20), dp(16), dp(28))
             addView(header)
-            addView(status, lp(20)); addView(display, lp(12)); addView(ai, lp(12)); addView(glossary, lp(12))
+            addView(status, lp(20)); addView(display, lp(12)); addView(ai, lp(12)); addView(modelCard, lp(12)); addView(glossary, lp(12))
             addView(dictCard, lp(12)); addView(tips, lp(12))
         }
         scroll = ScrollView(this).apply { setBackgroundColor(BG); isFillViewport = true; addView(root) }
@@ -286,7 +300,26 @@ class MainActivity : Activity() {
 
     private fun save() {
         Prefs.glossary = gl.text.toString()
+        Prefs.modelUrl = modelUrlBox.text.toString()
         Prefs.llmKey = llmKeyBox.text.toString(); Prefs.llmModel = llmModelBox.text.toString(); Prefs.llmBase = llmBaseBox.text.toString()
+    }
+
+    private fun refreshModel() {
+        modelOut.text = if (PpRec.installed(this)) "✓ ติดตั้งแล้ว (${PpRec.file(this).length() / 1024 / 1024} MB)" else "ยังไม่ได้โหลดโมเดล"
+    }
+
+    private fun downloadModel() {
+        save(); modelOut.text = "กำลังโหลด 0%"
+        val app = applicationContext; val url = Prefs.modelUrl
+        Thread {
+            val err = PpRec.download(app, url) { p -> runOnUiThread { if (!isDestroyed) modelOut.text = "กำลังโหลด $p%" } }
+            val ok = err == null && PpRec.load(app)
+            runOnUiThread {
+                if (isDestroyed) return@runOnUiThread
+                modelOut.text = if (ok) "✓ โหลดและพร้อมใช้ (หยุดแล้วเริ่มบริการใหม่เพื่อใช้ในหน้าที่กำลังแปล)"
+                                else "ผิดพลาด: ${err ?: PpRec.lastErr}"
+            }
+        }.start()
     }
 
     private fun refreshProv() {
