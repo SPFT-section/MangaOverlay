@@ -203,12 +203,14 @@ class MainActivity : Activity() {
         val modelCard = card {
             addView(section("โมเดลในเครื่อง (ONNX, ออฟไลน์) — แบ่งหน้าที่กัน 3 ตัว"))
             addView(tv("ทำงานต่อกันเป็นสายพาน: YOLO หากรอบคำพูด ขนานกับ ML Kit หาบรรทัด → PP-OCR อ่านตัวอักษร → MI-GAN ลบตัวอักษรเดิมขนานกับการแปล " +
-                "ใส่ลิงก์ .onnx แล้วกดโหลด หรือกด \"เลือกไฟล์\" เพื่อนำเข้าจากเครื่อง ไม่มีโมเดลตัวไหนก็ข้ามตัวนั้นเอง แอปยังใช้งานได้ หลังโหลดเสร็จให้หยุดแล้วเริ่มบริการใหม่", 12f, SUB).apply { setLineSpacing(0f, 1.15f) })
-            addView(modelBlock("1) YOLOv8n-bubble — ตรวจกรอบคำพูด", ModelStore.DET, Prefs.detUrl, "URL YOLOv8n-bubble .onnx",
-                "ใช้กรอบจากโมเดลรวมข้อความกรอบเดียวกัน และกำหนดขอบเขตกล่องคำแปล", Prefs.useDet) { Prefs.useDet = it }, lp(14))
-            addView(modelBlock("2) PP-OCR rec (v4/v5 mobile) — อ่านตัวอักษร", ModelStore.REC, Prefs.modelUrl, "URL โมเดล PP-OCR rec .onnx (เว้นว่าง = v4 ค่าเริ่มต้น)",
-                "อ่านทุกบรรทัดแล้วโหวตกับ ML Kit (ฟอนต์แคบ/เอฟเฟกต์)", Prefs.useModel) { Prefs.useModel = it }, lp(14))
-            addView(modelBlock("3) MI-GAN — ลบตัวอักษรเดิม", ModelStore.INP, Prefs.inpUrl, "URL MI-GAN .onnx (แบบ pipeline อินพุต uint8)",
+                "เว้นช่อง URL ว่างแล้วกดโหลดเพื่อใช้ลิงก์เริ่มต้น (รวมราว 135 MB ควรใช้ Wi-Fi) หรือกด \"เลือกไฟล์\" นำเข้าจากเครื่อง ไม่มีโมเดลตัวไหนก็ข้ามตัวนั้นเอง หลังโหลดเสร็จให้หยุดแล้วเริ่มบริการใหม่", 12f, SUB).apply { setLineSpacing(0f, 1.15f) })
+            addView(modelBlock("1) YOLOv8 speech-bubble — ตรวจกรอบคำพูด", ModelStore.DET, Prefs.detUrl, "URL .onnx (เว้นว่าง = kitsumed/yolov8m_seg-speech-bubble, 109 MB)",
+                "ใช้กรอบจากโมเดลรวมข้อความกรอบเดียวกัน และกำหนดขอบเขตกล่องคำแปล (ไฟล์ใหญ่ รันช้ากว่าตัว n)", Prefs.useDet) { Prefs.useDet = it }, lp(14))
+            addView(modelBlock("2) PP-OCRv5 mobile rec (อังกฤษ) — อ่านตัวอักษร", ModelStore.REC, Prefs.modelUrl, "URL .onnx (เว้นว่าง = en-ppocrv5-mobile-rec)",
+                "อ่านทุกบรรทัดแล้วโหวตกับ ML Kit (ฟอนต์แคบ/เอฟเฟกต์)", Prefs.useModel) { Prefs.useModel = it }, lp(8))
+            addView(modelBlock("   พจนานุกรมของโมเดลอ่านตัวอักษร (ต้องมีคู่กับข้อ 2)", ModelStore.RDICT, Prefs.dictUrl, "URL inference.yml / dict .txt (เว้นว่าง = ค่าเริ่มต้น)",
+                "ไฟล์ export ของ Paddle ไม่มีชุดตัวอักษรในตัว"), lp(8))
+            addView(modelBlock("3) MI-GAN — ลบตัวอักษรเดิม", ModelStore.INP, Prefs.inpUrl, "URL .onnx (เว้นว่าง = migan_pipeline_v2)",
                 "เติมพื้นหลังกรอบแทนการวางสีทึบทับ (ไม่มีโมเดล = ใช้สีทึบเหมือนเดิม)", Prefs.useInpaint) { Prefs.useInpaint = it }, lp(14))
         }
 
@@ -303,13 +305,14 @@ class MainActivity : Activity() {
         Prefs.glossary = gl.text.toString()
         for (r in modelRows) when (r.spec.id) {
             "rec" -> Prefs.modelUrl = r.urlBox.text.toString()
+            "recdict" -> Prefs.dictUrl = r.urlBox.text.toString()
             "det" -> Prefs.detUrl = r.urlBox.text.toString()
             "inp" -> Prefs.inpUrl = r.urlBox.text.toString()
         }
         Prefs.llmKey = llmKeyBox.text.toString(); Prefs.llmModel = llmModelBox.text.toString(); Prefs.llmBase = llmBaseBox.text.toString()
     }
 
-    private fun modelBlock(title: String, spec: ModelStore.Spec, url: String, hint: String, desc: String, on: Boolean, set: (Boolean) -> Unit): View {
+    private fun modelBlock(title: String, spec: ModelStore.Spec, url: String, hint: String, desc: String, on: Boolean = true, set: ((Boolean) -> Unit)? = null): View {
         val box = field(EditText(this).apply { this.hint = hint; setSingleLine(); setText(url) })
         val out = tv("", 13f, TXT).apply { setPadding(0, dp(8), 0, 0) }
         val row = ModelRow(spec, box, out); modelRows.add(row)
@@ -318,7 +321,7 @@ class MainActivity : Activity() {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             addView(tv(title, 14f, TXT, true))
-            addView(toggleRow("ใช้งาน", desc, on, set))
+            if (set != null) addView(toggleRow("ใช้งาน", desc, on, set)) else addView(tv(desc, 12f, SUB))
             addView(box, lp(6))
             val btns = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.HORIZONTAL }
             btns.addView(button("โหลดจาก URL", 0xFF374151.toInt()) { downloadModel(row) }, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(6) })
@@ -355,7 +358,7 @@ class MainActivity : Activity() {
     private fun downloadModel(r: ModelRow) {
         save(); r.out.text = "กำลังโหลด 0%"
         val app = applicationContext
-        val url = when (r.spec.id) { "rec" -> Prefs.modelUrl; "det" -> Prefs.detUrl; else -> Prefs.inpUrl }
+        val url = when (r.spec.id) { "rec" -> Prefs.modelUrl; "recdict" -> Prefs.dictUrl; "det" -> Prefs.detUrl; else -> Prefs.inpUrl }
         Thread {
             val err = ModelStore.download(app, r.spec, url) { p -> runOnUiThread { if (!isDestroyed) r.out.text = "กำลังโหลด $p%" } }
             runOnUiThread { if (!isDestroyed) finishModel(r, err) }

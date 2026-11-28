@@ -27,6 +27,8 @@ object BubbleDet {
     private var env: OrtEnvironment? = null
     private var inW = 640
     private var inH = 640
+    private var nm = 0          // จำนวนช่อง mask-coefficient ต่อท้ายคะแนนคลาส (โมเดล -seg = 32, detect ล้วน = 0)
+    private var outName = ""
     @Volatile var lastErr = ""
 
     fun installed(ctx: Context) = ModelStore.installed(ctx, ModelStore.DET)
@@ -42,6 +44,14 @@ object BubbleDet {
             if (sh.size != 4) { s.close(); lastErr = "อินพุตไม่ใช่ [1,3,H,W]"; return false }
             inH = if (sh[2] > 0) sh[2].toInt() else 640
             inW = if (sh[3] > 0) sh[3].toInt() else 640
+            // YOLOv8-seg มีสองเอาต์พุต: [1, 4+nc+nm, N] กับ protos [1, nm, h, w] ; เราใช้เฉพาะกรอบจึงขอแค่เอาต์พุตแรก
+            val outs = s.outputNames.toList()
+            outName = outs.first()
+            nm = 0
+            if (outs.size >= 2) {
+                val ps = (s.outputInfo[outs[1]]?.info as? TensorInfo)?.shape
+                if (ps != null && ps.size == 4) nm = if (ps[1] > 0) ps[1].toInt() else 32
+            }
             env = e; sess = s; true
         } catch (t: Throwable) { lastErr = t.javaClass.simpleName + ": " + (t.message ?: ""); false }
     }
@@ -70,7 +80,7 @@ object BubbleDet {
             }
             val cand = ArrayList<Det>()
             OnnxTensor.createTensor(e, FloatBuffer.wrap(arr), longArrayOf(1, 3, inH.toLong(), inW.toLong())).use { t ->
-                s.run(mapOf(s.inputNames.first() to t)).use { res ->
+                s.run(mapOf(s.inputNames.first() to t), setOf(outName)).use { res ->
                     val ot = res[0] as OnnxTensor
                     val shp = ot.info.shape
                     val fb = ot.floatBuffer; val d = FloatArray(fb.remaining()); fb.get(d)
@@ -94,11 +104,12 @@ object BubbleDet {
         }
         val first = a < b                         // [C, N] (มาตรฐาน) หรือ [N, C]
         val c = if (first) a else b; val n = if (first) b else a
-        if (c < 5) return
+        val nc = c - 4 - nm                       // จำนวนคลาสจริง (ตัดช่อง mask-coefficient ของโมเดล -seg ออก)
+        if (nc < 1) return
         fun v(ch: Int, i: Int) = if (first) d[ch * n + i] else d[i * c + ch]
         for (i in 0 until n) {
             var best = 0f; var bc = 0
-            for (k in 4 until c) { val sc = v(k, i); if (sc > best) { best = sc; bc = k - 4 } }
+            for (k in 4 until 4 + nc) { val sc = v(k, i); if (sc > best) { best = sc; bc = k - 4 } }
             if (best < CONF) continue
             val cx = v(0, i); val cy = v(1, i); val bw = v(2, i); val bh = v(3, i)
             add(cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2, best, bc)

@@ -14,8 +14,9 @@ import java.nio.ByteBuffer
 
 /**
  * ลบตัวอักษรเดิมด้วย MI-GAN (ONNX แบบ "pipeline": image uint8 [1,3,H,W] + mask uint8 [1,1,H,W] -> ภาพ uint8)
- * - ขั้วของมาสก์ (255 = รู หรือ 0 = รู) ต่างกันตามไฟล์ที่ export จึงทดสอบเองตอนโหลดด้วยภาพสังเคราะห์ (ช่องดำบนพื้นขาว)
- * - ภาพถูกยืดเป็นขนาดอินพุตของโมเดล (ค่าเริ่มต้น 512x512) แล้วย่อกลับ ; เอาเฉพาะพิกเซลในมาสก์ไปแทนที่ภาพเดิม
+ * - migan_pipeline_v2: H,W เป็น dynamic (ในกราฟครอปรอบรูแล้วเติมที่ 512x512 แล้ววางกลับเอง) จึงส่งภาพขนาดจริงเข้าไปได้เลย ไม่ยืด
+ *   ถ้าไฟล์ล็อกขนาดไว้ จะยืดเป็นขนาดนั้นแล้วย่อกลับ ; เอาเฉพาะพิกเซลในมาสก์ไปแทนที่ภาพเดิม
+ * - ขั้วของมาสก์ตามเอกสารของโมเดลคือ 0 = ลบ แต่ไฟล์ export อื่นอาจกลับขั้ว จึงทดสอบเองตอนโหลดด้วยภาพสังเคราะห์ (ช่องดำบนพื้นขาว)
  * - รันพร้อมกันได้สูงสุด 2 งาน (กันเมมโมรี่/CPU เต็มเมื่อมีหลายกรอบ)
  */
 object Inpaint {
@@ -26,7 +27,8 @@ object Inpaint {
     private var inW = 512
     private var inH = 512
     private var chw = true          // ผลลัพธ์เป็น [1,3,H,W] (true) หรือ [1,H,W,3]
-    @Volatile private var holeVal = 255
+    @Volatile private var holeVal = 0
+    private var dynamic = false     // ขนาดภาพอิสระ (ส่งขนาดจริงได้)
     private val gate = Semaphore(2)
     @Volatile var lastErr = ""
 
@@ -53,6 +55,7 @@ object Inpaint {
             if (sh.size == 4) {
                 inH = if (sh[2] > 0) sh[2].toInt() else 512
                 inW = if (sh[3] > 0) sh[3].toInt() else 512
+                dynamic = sh[2] <= 0 && sh[3] <= 0
             }
             env = e; sess = s
             if (!calibrate()) { sess = null; s.close(); return false }
@@ -69,9 +72,9 @@ object Inpaint {
         val cx = inW / 2; val cy = inH / 2; val q = minOf(inW, inH) / 8
         for (y in cy - q until cy + q) for (x in cx - q until cx + q) px[y * inW + x] = 0xFF000000.toInt()
         for (y in cy - q - 6 until cy + q + 6) for (x in cx - q - 6 until cx + q + 6) hole[y * inW + x] = true
-        for (v in intArrayOf(255, 0)) {
+        for (v in intArrayOf(0, 255)) {
             holeVal = v
-            val o = runRaw(px, hole) ?: return false
+            val o = runRaw(px, hole, inW, inH) ?: return false
             var sum = 0L; var n = 0
             for (y in cy - q / 2 until cy + q / 2) for (x in cx - q / 2 until cx + q / 2) { sum += (o[y * inW + x] shr 8) and 255; n++ }
             if (sum / n > 128) return true
@@ -79,18 +82,18 @@ object Inpaint {
         lastErr = "ทดสอบขั้วมาสก์ไม่ผ่าน (โมเดลอาจไม่ใช่ MI-GAN pipeline)"; return false
     }
 
-    /** px: ARGB ขนาด inW x inH ; hole: true = จุดที่ให้โมเดลวาดใหม่ ; คืน ARGB ขนาดเท่ากัน */
-    private fun runRaw(px: IntArray, hole: BooleanArray): IntArray? {
+    /** px: ARGB ขนาด w x h ; hole: true = จุดที่ให้โมเดลวาดใหม่ ; คืน ARGB ขนาดเท่ากัน */
+    private fun runRaw(px: IntArray, hole: BooleanArray, w: Int, h: Int): IntArray? {
         val s = sess ?: return null; val e = env ?: return null
-        val n = inW * inH
+        val n = w * h
         val img = ByteBuffer.allocateDirect(3 * n); val m = ByteBuffer.allocateDirect(n)
         for (i in 0 until n) {
             val c = px[i]
             img.put(i, ((c shr 16) and 255).toByte()); img.put(n + i, ((c shr 8) and 255).toByte()); img.put(2 * n + i, (c and 255).toByte())
             m.put(i, (if (hole[i]) holeVal else 255 - holeVal).toByte())
         }
-        val t1 = OnnxTensor.createTensor(e, img, longArrayOf(1, 3, inH.toLong(), inW.toLong()), OnnxJavaType.UINT8)
-        val t2 = OnnxTensor.createTensor(e, m, longArrayOf(1, 1, inH.toLong(), inW.toLong()), OnnxJavaType.UINT8)
+        val t1 = OnnxTensor.createTensor(e, img, longArrayOf(1, 3, h.toLong(), w.toLong()), OnnxJavaType.UINT8)
+        val t2 = OnnxTensor.createTensor(e, m, longArrayOf(1, 1, h.toLong(), w.toLong()), OnnxJavaType.UINT8)
         try {
             s.run(mapOf(imgName to t1, maskName to t2)).use { res ->
                 val ot = res[0] as OnnxTensor
@@ -119,22 +122,30 @@ object Inpaint {
         if (sess == null || holes.isEmpty()) return null
         return gate.withPermit {
             try {
-                val src = Bitmap.createBitmap(px, cw, ch, Bitmap.Config.ARGB_8888)
-                val sc = Bitmap.createScaledBitmap(src, inW, inH, true)
-                val spx = IntArray(inW * inH); sc.getPixels(spx, 0, inW, 0, 0, inW, inH)
-                if (sc !== src) sc.recycle(); src.recycle()
-                val mk = BooleanArray(inW * inH)
-                val fx = inW.toFloat() / cw; val fy = inH.toFloat() / ch
-                for (h in holes) {
-                    val x0 = (h.left * fx).toInt().coerceIn(0, inW); val x1 = (h.right * fx).toInt().coerceIn(0, inW)
-                    val y0 = (h.top * fy).toInt().coerceIn(0, inH); val y1 = (h.bottom * fy).toInt().coerceIn(0, inH)
-                    for (y in y0 until y1) for (x in x0 until x1) mk[y * inW + x] = true
+                // ขนาดที่ส่งเข้าโมเดล: dynamic = ขนาดจริง ; ไม่งั้นยืดเป็นขนาดที่โมเดลล็อกไว้
+                val tw = if (dynamic) cw else inW; val th = if (dynamic) ch else inH
+                val spx: IntArray
+                if (dynamic) spx = px else {
+                    val src = Bitmap.createBitmap(px, cw, ch, Bitmap.Config.ARGB_8888)
+                    val sc = Bitmap.createScaledBitmap(src, tw, th, true)
+                    spx = IntArray(tw * th); sc.getPixels(spx, 0, tw, 0, 0, tw, th)
+                    if (sc !== src) sc.recycle(); src.recycle()
                 }
-                val o = runRaw(spx, mk) ?: return@withPermit null
-                val ob = Bitmap.createBitmap(o, inW, inH, Bitmap.Config.ARGB_8888)
-                val back = Bitmap.createScaledBitmap(ob, cw, ch, true)
-                val bp = IntArray(cw * ch); back.getPixels(bp, 0, cw, 0, 0, cw, ch)
-                if (back !== ob) back.recycle(); ob.recycle()
+                val mk = BooleanArray(tw * th)
+                val fx = tw.toFloat() / cw; val fy = th.toFloat() / ch
+                for (h in holes) {
+                    val x0 = (h.left * fx).toInt().coerceIn(0, tw); val x1 = (h.right * fx).toInt().coerceIn(0, tw)
+                    val y0 = (h.top * fy).toInt().coerceIn(0, th); val y1 = (h.bottom * fy).toInt().coerceIn(0, th)
+                    for (y in y0 until y1) for (x in x0 until x1) mk[y * tw + x] = true
+                }
+                val o = runRaw(spx, mk, tw, th) ?: return@withPermit null
+                val bp: IntArray
+                if (dynamic) bp = o else {
+                    val ob = Bitmap.createBitmap(o, tw, th, Bitmap.Config.ARGB_8888)
+                    val back = Bitmap.createScaledBitmap(ob, cw, ch, true)
+                    bp = IntArray(cw * ch); back.getPixels(bp, 0, cw, 0, 0, cw, ch)
+                    if (back !== ob) back.recycle(); ob.recycle()
+                }
                 val res = px.copyOf()
                 for (h in holes) {
                     val x0 = h.left.coerceIn(0, cw); val x1 = h.right.coerceIn(0, cw)

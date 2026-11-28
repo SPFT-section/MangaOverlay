@@ -70,6 +70,11 @@ object Prefs {
         get() = sp.getString("inpurl", "") ?: ""
         set(v) { sp.edit().putString("inpurl", v.trim()).apply() }
 
+    /** ไฟล์พจนานุกรมของโมเดลอ่านตัวอักษร (inference.yml / .txt) ; ว่าง = ค่าเริ่มต้นของ ModelStore */
+    var dictUrl: String
+        get() = sp.getString("dicturl", "") ?: ""
+        set(v) { sp.edit().putString("dicturl", v.trim()).apply() }
+
     var glossary: String
         get() = if (::sp.isInitialized) sp.getString("glossary", "") ?: "" else ""
         set(v) { sp.edit().putString("glossary", v).apply() }

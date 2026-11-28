@@ -37,8 +37,10 @@ object PpRec {
         return try {
             val e = OrtEnvironment.getEnvironment()
             val s = e.createSession(f.absolutePath, OrtSession.SessionOptions().apply { setIntraOpNumThreads(2) })
-            val ch0 = s.metadata.customMetadata["character"]?.split('\n')
-            if (ch0.isNullOrEmpty()) { s.close(); lastErr = "โมเดลไม่มีตัวบอกชุดตัวอักษร (character)"; return false }
+            // ชุดตัวอักษร: metadata "character" (ไฟล์ของ RapidOCR) ถ้าไม่มี (ไฟล์ export ของ Paddle โดยตรง) ใช้ไฟล์พจนานุกรมที่นำเข้า
+            val meta = s.metadata.customMetadata["character"]?.split('\n')
+            val ch0 = if (!meta.isNullOrEmpty()) meta else loadDict(ctx)
+            if (ch0.isNullOrEmpty()) { s.close(); lastErr = "โมเดลไม่มีชุดตัวอักษร: ต้องนำเข้าไฟล์พจนานุกรม (inference.yml หรือ dict .txt) ของโมเดลนี้"; return false }
             // v5 มีชุดตัวอักษรใหญ่กว่า v4 มาก และบางไฟล์ลงท้ายด้วยบรรทัดว่าง : ใช้ขนาดเอาต์พุตของโมเดลตัดสินว่าต้องทิ้งบรรทัดท้ายไหม
             var ch: List<String> = ch0
             val od = ((s.outputInfo.values.first().info as? TensorInfo)?.shape?.lastOrNull() ?: -1L).toInt()
@@ -54,6 +56,31 @@ object PpRec {
     }
 
     @Synchronized fun close() { runCatching { sess?.close() }; sess = null }
+
+    private fun loadDict(ctx: Context): List<String>? {
+        val f = ModelStore.file(ctx, ModelStore.RDICT)
+        if (f.length() < ModelStore.RDICT.minBytes) return null
+        return try { parseDict(f.readText(Charsets.UTF_8)) } catch (e: Exception) { null }
+    }
+
+    /** inference.yml ของ PaddleOCR (รายการ character_dict) หรือไฟล์ .txt ตัวอักษรละบรรทัด */
+    internal fun parseDict(text: String): List<String> {
+        val lines = text.replace("\r", "").split('\n')
+        val k = lines.indexOfFirst { it.trimStart().startsWith("character_dict:") }
+        if (k < 0) return if (lines.isNotEmpty() && lines.last().isEmpty()) lines.dropLast(1) else lines
+        val out = ArrayList<String>()
+        for (i in k + 1 until lines.size) {
+            val t = lines[i].trimStart()
+            if (!t.startsWith("-")) { if (t.isEmpty()) continue else break }
+            var v = t.substring(1); if (v.startsWith(" ")) v = v.substring(1)
+            out.add(when {
+                v.length >= 2 && v[0] == '\'' && v.last() == '\'' -> v.substring(1, v.length - 1).replace("''", "'")
+                v.length >= 2 && v[0] == '"' && v.last() == '"' -> v.substring(1, v.length - 1).replace("\\\"", "\"").replace("\\\\", "\\")
+                else -> v.trimEnd()
+            })
+        }
+        return out
+    }
 
     /** อ่านข้อความบรรทัดเดียวในกรอบ r ของภาพ bmp : คืน (ข้อความ, ความมั่นใจ 0..1) */
     fun recognize(bmp: Bitmap, r: Rect): Pair<String, Float>? {
