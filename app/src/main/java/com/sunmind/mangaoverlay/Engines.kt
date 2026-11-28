@@ -28,7 +28,8 @@ import kotlin.math.min
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
-class Item(val r: Rect, val text: String, val bg: Int, val bubble: Boolean = false)
+/** patch = ภาพกรอบคำพูดที่ MI-GAN ลบตัวอักษรเดิมแล้ว (ขนาดเท่ากล่องที่วาง) ; null = ใช้สีพื้นทึบ bg แทน */
+class Item(val r: Rect, val text: String, val bg: Int, val bubble: Boolean = false, val patch: Bitmap? = null)
 
 /** items = กรอบที่พร้อมวาง, tr = คำแปล (เริ่มแปลไปพร้อมกับการหากรอบ จึงมักเสร็จก่อน/พร้อมกัน) */
 class Found(val items: List<Item>, val tr: Deferred<Map<String, String?>>, val better: Deferred<Map<String, String>>? = null,
@@ -60,28 +61,33 @@ object Ocr {
 
     suspend fun run(bmp: Bitmap, scope: CoroutineScope, minTop: Int = 0): Found {
         val none = Found(emptyList(), CompletableDeferred<Map<String, String?>>(emptyMap()))
+        // แบ่งหน้าที่: ML Kit หาบรรทัดข้อความ  ||  YOLOv8n-bubble หากรอบคำพูด  (เริ่มพร้อมกัน)
+        val detJob = scope.async(Dispatchers.Default) { if (Prefs.useDet && BubbleDet.ready()) BubbleDet.detect(bmp) else emptyList() }
         val t = try { rec.process(InputImage.fromBitmap(bmp, 0)).await() }
                 catch (e: CancellationException) { throw e }   // ห้ามกลืน cancellation
-                catch (e: Exception) { return none }
+                catch (e: Exception) { detJob.cancelAndJoin(); return none }
         return withContext(Dispatchers.Default) {
             try {
                 val w = bmp.width; val h = bmp.height
                 val px = IntArray(w * h); bmp.getPixels(px, 0, w, 0, 0, w, h)
                 val img = Img(px, w, h)
                 val cut = intArrayOf(Int.MAX_VALUE, -1)
-                val bl = refine(bmp, blocks(img, t, minTop, cut).take(40))
+                val bubbles = detJob.await().map { it.r }
+                val bl = refine(bmp, blocks(img, t, minTop, cut, bubbles).take(40))
                 val texts = bl.map { normalize(it.text) }
                 // เริ่มแปลทันที ขนานไปกับการหากรอบคำพูด: เครื่องแปลเร็ว (ได้ก่อน) + AI (ถ้าตั้งไว้ ได้ทีหลังแต่ดีกว่า)
                 val d = texts.distinct()
                 val tr = scope.async(Dispatchers.IO) { d.zip(Translator.translate(d)).toMap() }
                 val better = if (Llm.enabled() && d.isNotEmpty()) scope.async(Dispatchers.IO) { Translator.refine(texts) } else null
-                val items = bl.mapIndexed { i, b -> async { toItem(img, b, texts[i]) } }.awaitAll()
+                // แปลกำลังวิ่งอยู่ ; ตรงนี้ลบข้อความเดิมด้วย MI-GAN ขนานกันไปทีละกรอบ (จำกัดต่อหน้า กันช้า)
+                val inpLeft = java.util.concurrent.atomic.AtomicInteger(12)
+                val items = bl.mapIndexed { i, b -> async { toItem(img, b, texts[i], bubbles, inpLeft) } }.awaitAll()
                 Found(items, tr, better, if (cut[0] == Int.MAX_VALUE) -1 else cut[0], cut[1])
             } catch (e: CancellationException) { throw e } catch (e: Exception) { none }
         }
     }
 
-    private fun blocks(img: Img, t: Text, minTop: Int, cut: IntArray): List<Blk> {
+    private fun blocks(img: Img, t: Text, minTop: Int, cut: IntArray, bubbles: List<Rect>): List<Blk> {
         val raw = ArrayList<Blk>()
         for (b in t.textBlocks) {
             val bb = b.boundingBox ?: continue
@@ -103,7 +109,7 @@ object Ocr {
             raw.add(Blk(Rect(bb), s, if (hs.isEmpty()) bb.height() else hs[hs.size / 2], if (b.lines.isEmpty()) 1f else b.lines.map { it.confidence }.average().toFloat(),
                 b.lines.mapNotNull { it.boundingBox }.map { Rect(it) }))
         }
-        val merged = if (Prefs.merge) merge(img, raw) else raw
+        val merged = if (Prefs.merge) merge(img, raw, bubbles) else raw
         return merged.sortedWith(compareBy({ it.r.top }, { it.r.left })).filter { b ->
             val core = b.text.filter { it.isLetter() }   // "I?" "A!" "I..." ต้องไม่ถูกทิ้ง (เดิมเทียบทั้งข้อความกับ "I"/"A" เป๊ะ ๆ)
             !(core.length < 2 && core != "I" && core != "A") && !noLetterRe.matches(b.text)
@@ -140,42 +146,43 @@ object Ocr {
      * คะแนน = สัดส่วนคำจริง + มั่นใจของ OCR + ความสอดคล้องกับผลแบบอื่น ; จากนั้นแก้คำเพี้ยนด้วย Spell
      */
     private suspend fun refine(bmp: Bitmap, bl: List<Blk>): List<Blk> {
+        // PP-OCR อ่านทุกบล็อกพร้อมกัน (เบา) : ML Kit = ตัวหาบรรทัด, PP-OCR = ตัวอ่าน แล้วโหวตกัน ;
+        // ส่วนอ่านซ้ำด้วย ML Kit หลายแบบ (หนัก) ยังจำกัด 5 บล็อก/หน้า และทำเฉพาะเมื่อ PP-OCR ก็ยังไม่มั่นใจ
+        val pp: List<Cand?> = if (Prefs.useModel && PpRec.ready())
+            coroutineScope { bl.map { b -> async(Dispatchers.Default) { ppRead(bmp, b) } }.awaitAll() } else bl.map { null }
         var budget = 5
         val out = ArrayList<Blk>(bl.size)
-        for (b in bl) {
-            val s0 = score(b.text)
-            if (budget <= 0 || (b.conf >= 0.85f && s0 >= 0.6f)) { out.add(b); continue }
-            budget--
-            val cr = crop(bmp, b.r)
+        for ((i, b) in bl.withIndex()) {
+            val s0 = score(b.text); val p = pp[i]
+            val agree = p == null || sim(p.text, b.text) >= 0.85f
+            if (agree && b.conf >= 0.85f && s0 >= 0.6f) { out.add(b); continue }
+            if (p == null && budget <= 0) { out.add(b); continue }
             val cands = arrayListOf(Cand(b.text, b.conf))
-            // โมเดล PP-OCR อ่านทีละบรรทัด (ใช้กรอบบรรทัดจาก ML Kit) : แม่นกับฟอนต์แคบ/เอฟเฟกต์ที่ ML Kit อ่านเป็นขยะ
-            if (Prefs.useModel && PpRec.ready() && b.lines.isNotEmpty()) {
-                val rs = b.lines.sortedBy { it.top }.map { PpRec.recognize(bmp, it) }
-                if (rs.all { it != null }) {
-                    val s = clean(rs.joinToString(" ") { it!!.first })
-                    if (s.isNotBlank() && !junkRe.containsMatchIn(s)) cands.add(Cand(s, rs.map { it!!.second }.average().toFloat(), true))
-                }
-            }
-            val modelGood = cands.any { it.model && it.conf >= 0.85f && score(it.text) >= 0.8f }
-            if (cr != null && !modelGood) {
-                val sc = (96f / max(cr.third, 1)).toInt().coerceIn(2, 4)   // ให้ตัวอักษรสูงราว 100px+ ซึ่งเป็นช่วงที่ OCR อ่านดีที่สุด
-                for (v in Bin.variants(cr.first, cr.second, cr.third, sc)) {
-                    val pb = try { Bitmap.createBitmap(v.px, v.w, v.h, Bitmap.Config.ARGB_8888) } catch (e: Exception) { continue }
-                    val t2 = try { rec.process(InputImage.fromBitmap(pb, 0)).await() }
-                             catch (e: CancellationException) { throw e } catch (e: Exception) { null }
-                    pb.recycle()
-                    if (t2 == null) continue
-                    val ls = t2.textBlocks.flatMap { it.lines }
-                    if (ls.isEmpty()) continue
-                    val s = clean(t2.textBlocks.joinToString(" ") { it.text })
-                    if (s.isBlank() || junkRe.containsMatchIn(s)) continue
-                    cands.add(Cand(s, ls.map { it.confidence }.average().toFloat()))
-                    if (cands.size >= 3 && score(s) >= 0.8f && cands.last().conf >= 0.8f) break
+            if (p != null) cands.add(p)
+            val modelGood = p != null && p.conf >= 0.85f && score(p.text) >= 0.8f
+            if (!modelGood && budget > 0) {
+                budget--
+                val cr = crop(bmp, b.r)
+                if (cr != null) {
+                    val sc = (96f / max(cr.third, 1)).toInt().coerceIn(2, 4)   // ให้ตัวอักษรสูงราว 100px+ ซึ่งเป็นช่วงที่ OCR อ่านดีที่สุด
+                    for (v in Bin.variants(cr.first, cr.second, cr.third, sc)) {
+                        val pb = try { Bitmap.createBitmap(v.px, v.w, v.h, Bitmap.Config.ARGB_8888) } catch (e: Exception) { continue }
+                        val t2 = try { rec.process(InputImage.fromBitmap(pb, 0)).await() }
+                                 catch (e: CancellationException) { throw e } catch (e: Exception) { null }
+                        pb.recycle()
+                        if (t2 == null) continue
+                        val ls = t2.textBlocks.flatMap { it.lines }
+                        if (ls.isEmpty()) continue
+                        val s = clean(t2.textBlocks.joinToString(" ") { it.text })
+                        if (s.isBlank() || junkRe.containsMatchIn(s)) continue
+                        cands.add(Cand(s, ls.map { it.confidence }.average().toFloat()))
+                        if (cands.size >= 3 && score(s) >= 0.8f && cands.last().conf >= 0.8f) break
+                    }
                 }
             }
             val best = cands.maxByOrNull { c ->
-                val agree = if (cands.size > 1) cands.filter { it !== c }.map { sim(c.text, it.text) }.average().toFloat() else 0f
-                score(c.text) + 0.5f * c.conf + 0.5f * agree + (if (c.model && c.conf >= 0.8f) 0.2f else 0f)
+                val agreeC = if (cands.size > 1) cands.filter { it !== c }.map { sim(c.text, it.text) }.average().toFloat() else 0f
+                score(c.text) + 0.5f * c.conf + 0.5f * agreeC + (if (c.model && c.conf >= 0.8f) 0.2f else 0f)
             }!!
             out.add(Blk(b.r, spellFix(best.text), b.lh, best.conf, b.lines))
         }
@@ -183,14 +190,67 @@ object Ocr {
         return out.filter { b -> !(Dict.ready() && wordRe.findAll(b.text).count() >= 3 && score(b.text) < 0.4f && b.conf < 0.75f) }
     }
 
+    /** โมเดล PP-OCR อ่านทีละบรรทัด (ใช้กรอบบรรทัดจาก ML Kit) : แม่นกับฟอนต์แคบ/เอฟเฟกต์ที่ ML Kit อ่านเป็นขยะ */
+    private fun ppRead(bmp: Bitmap, b: Blk): Cand? {
+        if (b.lines.isEmpty()) return null
+        val rs = b.lines.sortedBy { it.top }.map { PpRec.recognize(bmp, it) }
+        if (!rs.all { it != null }) return null
+        val s = clean(rs.joinToString(" ") { it!!.first })
+        if (s.isBlank() || junkRe.containsMatchIn(s)) return null
+        return Cand(s, rs.map { it!!.second }.average().toFloat(), true)
+    }
+
     private fun spellFix(s: String): String {
         if (!Dict.ready()) return s
         return Spell.fix(s, { w -> w.length <= 2 || w.lowercase() in stop || Dict.lookup(w) != null }, Dict.vocab(), stop)
     }
 
-    private fun toItem(img: Img, b: Blk, text: String): Item {
-        val f = if (Prefs.fit) fit(img, b.r) else null
-        return Item(f?.r ?: Rect(b.r), text, f?.bg ?: bgOf(img, b.r), f != null)
+    private suspend fun toItem(img: Img, b: Blk, text: String, bubbles: List<Rect>, inpLeft: java.util.concurrent.atomic.AtomicInteger): Item {
+        val bi = bubbleOf(b.r, bubbles)
+        // YOLO เจอกรอบ = ใช้ขอบเขตจากโมเดล (ทนกว่า flood-fill เวลากรอบไล่สี/ขอบรั่ว) ; ไม่เจอ = flood-fill แบบเดิม
+        val f = if (!Prefs.fit) null else if (bi >= 0) fitBubble(img, b.r, bubbles[bi]) else fit(img, b.r)
+        val rect = f?.r ?: Rect(b.r)
+        val pd = if (f != null) 0 else 6   // ต้องตรงกับ pd ใน OverlayService.addItems
+        val patch = if (Prefs.useInpaint && Inpaint.ready())
+            patchFor(img, b, Rect(rect.left - pd, rect.top - pd, rect.right + pd, rect.bottom + pd), inpLeft) else null
+        return Item(rect, text, f?.bg ?: bgOf(img, b.r), f != null, patch)
+    }
+
+    /** MI-GAN: ลบบรรทัดข้อความเดิมในกล่อง pr (มาสก์ = กรอบบรรทัดขยายออกเล็กน้อย) ; null = ใช้สีพื้นแทน */
+    private suspend fun patchFor(img: Img, b: Blk, pr: Rect, left: java.util.concurrent.atomic.AtomicInteger): Bitmap? {
+        if (pr.left < 0 || pr.top < 0 || pr.right > img.w || pr.bottom > img.h) return null
+        val cw = pr.width(); val ch = pr.height()
+        if (cw < 24 || ch < 24 || left.getAndDecrement() <= 0) return null
+        val px = IntArray(cw * ch)
+        for (y in 0 until ch) System.arraycopy(img.px, (pr.top + y) * img.w + pr.left, px, y * cw, cw)
+        val e = max(3, (b.lh * 0.25f).toInt())
+        val holes = (if (b.lines.isEmpty()) listOf(b.r) else b.lines).mapNotNull { l ->
+            val r = Rect(l.left - e - pr.left, l.top - e - pr.top, l.right + e - pr.left, l.bottom + e - pr.top)
+            if (r.intersect(0, 0, cw, ch)) r else null
+        }
+        val o = Inpaint.erase(px, cw, ch, holes) ?: return null
+        return Bitmap.createBitmap(o, cw, ch, Bitmap.Config.ARGB_8888)
+    }
+
+    /** กรอบคำพูดที่ YOLO ตรวจได้ที่ครอบจุดกึ่งกลางของ r (เล็กสุดถ้าซ้อนกัน) ; -1 = ไม่มี */
+    private fun bubbleOf(r: Rect, bubbles: List<Rect>): Int {
+        var best = -1; var ba = Long.MAX_VALUE
+        for ((i, b) in bubbles.withIndex()) if (b.contains(r.centerX(), r.centerY())) {
+            val a = b.width().toLong() * b.height(); if (a < ba) { ba = a; best = i }
+        }
+        return best
+    }
+
+    /** กล่องวางคำแปลจากขอบเขตกรอบของ YOLO : กรอบสี่เหลี่ยมใช้เกือบเต็ม วงรีใช้ส่วนใน (0.88) แล้วสมมาตรรอบข้อความเหมือน fit() */
+    private fun fitBubble(img: Img, t: Rect, bb: Rect): Fit {
+        val hw = (bb.width() / 2f * 0.88f).toInt(); val hh = (bb.height() / 2f * 0.88f).toInt()
+        val r = Rect(bb.centerX() - hw, bb.centerY() - hh, bb.centerX() + hw, bb.centerY() + hh)
+        r.union(Rect(t.left - 4, t.top - 4, t.right + 4, t.bottom + 4))
+        if (!r.intersect(bb)) r.set(t)
+        val ex = min(t.left - r.left, r.right - t.right).coerceAtLeast(0)
+        val ey = min(t.top - r.top, r.bottom - t.bottom).coerceAtLeast(0)
+        r.set(t.left - ex, t.top - ey, t.right + ex, t.bottom + ey)
+        return Fit(r, bgOf(img, t))
     }
 
     /** แก้ที่ OCR อ่านผิดบ่อยในฟอนต์มังงะ */
@@ -210,11 +270,11 @@ object Ocr {
     }
 
     // ---------- รวมบล็อกที่อยู่ในกรอบคำพูดเดียวกัน ----------
-    private fun merge(img: Img, a: List<Blk>): List<Blk> {
+    private fun merge(img: Img, a: List<Blk>, bubbles: List<Rect>): List<Blk> {
         val n = a.size
         val p = IntArray(n) { it }
         fun f(x: Int): Int { var y = x; while (p[y] != y) { p[y] = p[p[y]]; y = p[y] }; return y }
-        for (i in 0 until n) for (j in i + 1 until n) if (same(img, a[i], a[j])) p[f(i)] = f(j)
+        for (i in 0 until n) for (j in i + 1 until n) if (same(img, a[i], a[j], bubbles)) p[f(i)] = f(j)
         return (0 until n).groupBy { f(it) }.values.map { g ->
             val m = g.map { a[it] }.sortedBy { it.r.top }
             val r = Rect(m[0].r)
@@ -223,7 +283,10 @@ object Ocr {
         }
     }
 
-    private fun same(img: Img, a: Blk, b: Blk): Boolean {
+    private fun same(img: Img, a: Blk, b: Blk, bubbles: List<Rect>): Boolean {
+        // YOLO ชี้ชัดทั้งคู่ = กรอบเดียวกันก็รวม คนละกรอบก็ไม่รวม (ไม่ต้องเดาจากระยะห่าง/เส้นขอบ)
+        val ba = bubbleOf(a.r, bubbles); val bb = bubbleOf(b.r, bubbles)
+        if (ba >= 0 && bb >= 0) return ba == bb
         val u = if (a.r.top <= b.r.top) a else b
         val d = if (u === a) b else a
         val lo = min(u.lh, d.lh).coerceAtLeast(1)
@@ -543,7 +606,7 @@ object Translator {
         onStatus = null
         saveDisk()
         client?.close(); client = null; offlineReady = false
-        PpRec.close()
+        PpRec.close(); BubbleDet.close(); Inpaint.close()
     }
     private fun status(m: String) { onStatus?.invoke(m) }
     private fun setEngine(e: String) { if (e != lastEngine) { lastEngine = e; status("แปลด้วย: $e") } }
@@ -551,7 +614,9 @@ object Translator {
 
     suspend fun warmUp() = coroutineScope {
         launch(Dispatchers.IO) { Dict.load(app) }
-        launch(Dispatchers.IO) { if (Prefs.useModel) PpRec.load(app) }
+        launch(Dispatchers.IO) { if (Prefs.useModel && PpRec.installed(app) && !PpRec.load(app)) status("โมเดลอ่านตัวอักษรโหลดไม่ได้ (${PpRec.lastErr})") }
+        launch(Dispatchers.IO) { if (Prefs.useDet && BubbleDet.installed(app) && !BubbleDet.load(app)) status("YOLO โหลดไม่ได้ (${BubbleDet.lastErr})") }
+        launch(Dispatchers.IO) { if (Prefs.useInpaint && Inpaint.installed(app) && !Inpaint.load(app)) status("MI-GAN โหลดไม่ได้ (${Inpaint.lastErr})") }
         launch(Dispatchers.IO) { callRetry("hi") }
         launch(Dispatchers.IO) { edgeToken(false) }
         launch {
