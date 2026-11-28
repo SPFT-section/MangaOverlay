@@ -3,26 +3,21 @@ package com.sunmind.mangaoverlay
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
+import ai.onnxruntime.TensorInfo
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Rect
-import java.io.File
-import java.net.HttpURLConnection
-import java.net.URL
 import java.nio.FloatBuffer
-import java.security.MessageDigest
 import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
 
 /**
- * ตัวอ่านตัวอักษรจากโมเดล PP-OCRv4 (ONNX) ที่โหลดจาก Hugging Face ครั้งเดียวแล้วรันในเครื่อง (ออฟไลน์)
+ * ตัวอ่านตัวอักษรจากโมเดล PP-OCR recognition (ONNX, v4 หรือ v5 mobile) ที่โหลด/นำเข้าครั้งเดียวแล้วรันในเครื่อง (ออฟไลน์)
  * อ่านทีละบรรทัด (รับกรอบบรรทัดจาก ML Kit) ; จำกัดคำตอบเป็น ASCII เพราะมังงะที่อ่านเป็นภาษาอังกฤษ (โมเดลรู้จักจีนด้วย แต่จะทำให้เดามั่ว)
  * ทดสอบแล้วกับภาพจริง: AAAAAGH!! (0.96), "THE DOCK DISTRICT OF / SLIMEP.. IS LIBERATED" ที่ ML Kit อ่านเป็นขยะ
  */
 object PpRec {
-    const val DEFAULT_URL = "https://huggingface.co/SWHL/RapidOCR/resolve/main/PP-OCRv4/ch_PP-OCRv4_rec_infer.onnx"
-    private const val DEFAULT_SHA = "48fc40f24f6d2a207a2b1091d3437eb3cc3eb6b676dc3ef9c37384005483683b"
     private const val H = 48
     private const val MINW = 320
 
@@ -32,8 +27,8 @@ object PpRec {
     private var allowed = IntArray(0)
     @Volatile var lastErr = ""
 
-    fun file(ctx: Context) = File(File(ctx.filesDir, "models").apply { mkdirs() }, "rec.onnx")
-    fun installed(ctx: Context) = file(ctx).length() > 1_000_000
+    fun file(ctx: Context) = ModelStore.file(ctx, ModelStore.REC)
+    fun installed(ctx: Context) = ModelStore.installed(ctx, ModelStore.REC)
     fun ready() = sess != null
 
     @Synchronized fun load(ctx: Context): Boolean {
@@ -42,8 +37,12 @@ object PpRec {
         return try {
             val e = OrtEnvironment.getEnvironment()
             val s = e.createSession(f.absolutePath, OrtSession.SessionOptions().apply { setIntraOpNumThreads(2) })
-            val ch = s.metadata.customMetadata["character"]?.split('\n')
-            if (ch.isNullOrEmpty()) { s.close(); lastErr = "โมเดลไม่มีตัวบอกชุดตัวอักษร (character)"; return false }
+            val ch0 = s.metadata.customMetadata["character"]?.split('\n')
+            if (ch0.isNullOrEmpty()) { s.close(); lastErr = "โมเดลไม่มีตัวบอกชุดตัวอักษร (character)"; return false }
+            // v5 มีชุดตัวอักษรใหญ่กว่า v4 มาก และบางไฟล์ลงท้ายด้วยบรรทัดว่าง : ใช้ขนาดเอาต์พุตของโมเดลตัดสินว่าต้องทิ้งบรรทัดท้ายไหม
+            var ch: List<String> = ch0
+            val od = ((s.outputInfo.values.first().info as? TensorInfo)?.shape?.lastOrNull() ?: -1L).toInt()
+            if (od > 0 && ch.last().isEmpty() && od != ch.size + 2 && od != ch.size + 1) ch = ch.dropLast(1)
             chars = ch
             // index 0 = blank, 1..n = chars, n+1 = เว้นวรรค ; เก็บเฉพาะ ASCII ที่พิมพ์ได้
             val al = ArrayList<Int>()
@@ -55,33 +54,6 @@ object PpRec {
     }
 
     @Synchronized fun close() { runCatching { sess?.close() }; sess = null }
-
-    /** โหลดโมเดลจาก url (ไม่ส่ง = ค่าเริ่มต้น) ; คืน null = สำเร็จ ไม่งั้นคืนข้อความผิดพลาด ; เรียกบน thread พื้นหลัง */
-    fun download(ctx: Context, url0: String, onProgress: (Int) -> Unit): String? {
-        val url = url0.ifBlank { DEFAULT_URL }
-        val dst = file(ctx); val tmp = File(dst.parentFile, "rec.tmp")
-        var c: HttpURLConnection? = null
-        try {
-            c = URL(url).openConnection() as HttpURLConnection
-            c.connectTimeout = 10000; c.readTimeout = 20000; c.instanceFollowRedirects = true
-            if (c.responseCode != 200) return "HTTP ${c.responseCode}"
-            val total = c.contentLengthLong; var got = 0L; var last = -1
-            val md = MessageDigest.getInstance("SHA-256")
-            c.inputStream.use { ins -> tmp.outputStream().use { os ->
-                val buf = ByteArray(64 * 1024)
-                while (true) {
-                    val n = ins.read(buf); if (n < 0) break
-                    os.write(buf, 0, n); md.update(buf, 0, n); got += n
-                    if (total > 0) { val p = (got * 100 / total).toInt(); if (p != last) { last = p; onProgress(p) } }
-                }
-            } }
-            if (got < 1_000_000) { tmp.delete(); return "ไฟล์เล็กผิดปกติ ($got ไบต์)" }
-            if (url == DEFAULT_URL && md.digest().joinToString("") { "%02x".format(it) } != DEFAULT_SHA) { tmp.delete(); return "SHA-256 ไม่ตรง (ไฟล์เสียหรือถูกเปลี่ยน)" }
-            close(); dst.delete()
-            return if (tmp.renameTo(dst)) null else "บันทึกไฟล์ไม่ได้"
-        } catch (e: Exception) { tmp.delete(); return e.javaClass.simpleName + ": " + (e.message ?: "") }
-        finally { c?.disconnect() }
-    }
 
     /** อ่านข้อความบรรทัดเดียวในกรอบ r ของภาพ bmp : คืน (ข้อความ, ความมั่นใจ 0..1) */
     fun recognize(bmp: Bitmap, r: Rect): Pair<String, Float>? {
@@ -118,11 +90,12 @@ object PpRec {
 
     /** CTC แบบ greedy เฉพาะ ASCII+เว้นวรรค */
     private fun decode(o: Array<FloatArray>): Pair<String, Float>? {
-        if (o.isEmpty() || o[0].size != chars.size + 2) { lastErr = "รูปแบบเอาต์พุตของโมเดลไม่ตรงกับชุดตัวอักษร"; return null }
+        // เอาต์พุต = blank + ตัวอักษร (+ เว้นวรรคถ้าโมเดลมี) ; ไม่ตรงทั้งสองแบบ = ชุดตัวอักษรกับโมเดลไม่ใช่คู่กัน
+        if (o.isEmpty() || (o[0].size != chars.size + 2 && o[0].size != chars.size + 1)) { lastErr = "รูปแบบเอาต์พุตของโมเดลไม่ตรงกับชุดตัวอักษร"; return null }
         val sb = StringBuilder(); var prev = -1; var sum = 0f; var n = 0
         for (row in o) {
             var bi = 0; var bp = row[0]
-            for (i in allowed) if (row[i] > bp) { bp = row[i]; bi = i }
+            for (i in allowed) if (i < row.size && row[i] > bp) { bp = row[i]; bi = i }
             if (bi != 0 && bi != prev) { sb.append(if (bi == chars.size + 1) " " else chars[bi - 1]); sum += bp; n++ }
             prev = bi
         }

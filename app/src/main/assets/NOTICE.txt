@@ -3,3 +3,8 @@ Thai WordNet Copyright 2011 by the National Institute of Information and Communi
 WordNet 3.0 Copyright 2006 by Princeton University. All rights reserved. Used under the WordNet license (https://wordnet.princeton.edu/license-and-commercial-use).
 
 PP-OCRv4 recognition model (PaddleOCR, Apache License 2.0), ONNX export by RapidOCR (SWHL/RapidOCR on Hugging Face, Apache-2.0). Downloaded by the user at runtime; not bundled. ONNX Runtime (MIT).
+
+Optional on-device models (ONNX Runtime, supplied by the user via URL or file; not bundled):
+- MI-GAN image inpainting (Picsart AI Research, MIT License).
+- PP-OCRv4/v5 recognition (PaddleOCR, Apache License 2.0).
+- YOLOv8n-bubble: a YOLOv8 detector. Ultralytics YOLOv8 code/weights are AGPL-3.0 unless a separate license is held; check the license of the specific weights you use.

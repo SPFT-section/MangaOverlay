@@ -542,7 +542,7 @@ class OverlayService : Service() {
                 }
             }
             if (skip) continue
-            val tv = makeTv(item.bg)
+            val tv = makeTv(item.bg, item.patch)
             tv.visibility = View.INVISIBLE   // ยังไม่มีคำแปล: ไม่ให้กล่องเปล่าบังต้นฉบับ
             container.addView(tv, FrameLayout.LayoutParams(w.toInt(), h.toInt()).apply { leftMargin = l.toInt(); topMargin = t.toInt() })
             views.add(Pair(tv, item))
@@ -631,11 +631,13 @@ class OverlayService : Service() {
         return true
     }
 
-    private fun makeTv(bg: Int) = TextView(this).apply {
+    /** patch = ภาพพื้นหลังกรอบที่ MI-GAN ลบตัวอักษรเดิมแล้ว (ถ้ามี) ไม่งั้นใช้สีพื้นทึบ */
+    private fun makeTv(bg: Int, patch: Bitmap? = null) = TextView(this).apply {
         gravity = Gravity.CENTER; setPadding(4, 2, 4, 2)
         val lum = 0.299 * Color.red(bg) + 0.587 * Color.green(bg) + 0.114 * Color.blue(bg)
         setTextColor(if (lum > 140) Color.BLACK else Color.WHITE)
-        background = GradientDrawable().apply { setColor(Color.rgb(Color.red(bg), Color.green(bg), Color.blue(bg))); cornerRadius = 10f }
+        background = if (patch != null) android.graphics.drawable.BitmapDrawable(resources, patch)
+                     else GradientDrawable().apply { setColor(Color.rgb(Color.red(bg), Color.green(bg), Color.blue(bg))); cornerRadius = 10f }
         breakStrategy = Layout.BREAK_STRATEGY_BALANCED       // ตัดบรรทัดให้สมดุลเหมือนในกรอบคำพูด
         hyphenationFrequency = Layout.HYPHENATION_FREQUENCY_NONE
         if (Prefs.bold) typeface = Typeface.DEFAULT_BOLD

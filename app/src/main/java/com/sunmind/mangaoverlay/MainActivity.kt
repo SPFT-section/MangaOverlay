@@ -56,8 +56,9 @@ class MainActivity : Activity() {
     private lateinit var llmModelBox: EditText
     private lateinit var llmBaseBox: EditText
     private lateinit var llmOut: TextView
-    private lateinit var modelOut: TextView
-    private lateinit var modelUrlBox: EditText
+    private class ModelRow(val spec: ModelStore.Spec, val urlBox: EditText, val out: TextView)
+    private val modelRows = ArrayList<ModelRow>()
+    private val reqImport = 10   // 10 + ลำดับของโมเดลใน modelRows
     private lateinit var provChips: List<TextView>
     private val provNames = listOf("ปิด", "Gemini", "OpenAI-compat", "Claude")
 
@@ -199,16 +200,16 @@ class MainActivity : Activity() {
             addView(seekRow("ชดเชยความหน่วงตอนเลื่อน", 0, 120, Prefs.lead, { "$it ms" }) { Prefs.lead = it })
         }
 
-        modelUrlBox = field(EditText(this).apply { hint = "URL โมเดล .onnx (เว้นว่าง = ค่าเริ่มต้น)"; setSingleLine(); setText(Prefs.modelUrl) })
-        modelOut = tv("", 13f, TXT).apply { setPadding(0, dp(8), 0, 0) }
-        refreshModel()
         val modelCard = card {
-            addView(section("โมเดลอ่านตัวอักษร (โหลดจาก Hugging Face)"))
-            addView(tv("โหลดครั้งเดียว ~11 MB (PP-OCRv4 ONNX) แล้วรันในเครื่อง ช่วยอ่านฟอนต์แคบ/เอฟเฟกต์ที่ ML Kit อ่านเพี้ยน ใช้กับกรอบที่ OCR ปกติไม่มั่นใจเท่านั้น หลังโหลดเสร็จให้หยุดแล้วเริ่มบริการใหม่", 12f, SUB).apply { setLineSpacing(0f, 1.15f) })
-            addView(toggleRow("ใช้โมเดลช่วยอ่าน", "อ่านซ้ำเฉพาะกรอบที่ไม่มั่นใจ", Prefs.useModel) { Prefs.useModel = it })
-            addView(modelUrlBox, lp(8))
-            addView(button("โหลดโมเดล", 0xFF374151.toInt()) { downloadModel() }, lp(10))
-            addView(modelOut)
+            addView(section("โมเดลในเครื่อง (ONNX, ออฟไลน์) — แบ่งหน้าที่กัน 3 ตัว"))
+            addView(tv("ทำงานต่อกันเป็นสายพาน: YOLO หากรอบคำพูด ขนานกับ ML Kit หาบรรทัด → PP-OCR อ่านตัวอักษร → MI-GAN ลบตัวอักษรเดิมขนานกับการแปล " +
+                "ใส่ลิงก์ .onnx แล้วกดโหลด หรือกด \"เลือกไฟล์\" เพื่อนำเข้าจากเครื่อง ไม่มีโมเดลตัวไหนก็ข้ามตัวนั้นเอง แอปยังใช้งานได้ หลังโหลดเสร็จให้หยุดแล้วเริ่มบริการใหม่", 12f, SUB).apply { setLineSpacing(0f, 1.15f) })
+            addView(modelBlock("1) YOLOv8n-bubble — ตรวจกรอบคำพูด", ModelStore.DET, Prefs.detUrl, "URL YOLOv8n-bubble .onnx",
+                "ใช้กรอบจากโมเดลรวมข้อความกรอบเดียวกัน และกำหนดขอบเขตกล่องคำแปล", Prefs.useDet) { Prefs.useDet = it }, lp(14))
+            addView(modelBlock("2) PP-OCR rec (v4/v5 mobile) — อ่านตัวอักษร", ModelStore.REC, Prefs.modelUrl, "URL โมเดล PP-OCR rec .onnx (เว้นว่าง = v4 ค่าเริ่มต้น)",
+                "อ่านทุกบรรทัดแล้วโหวตกับ ML Kit (ฟอนต์แคบ/เอฟเฟกต์)", Prefs.useModel) { Prefs.useModel = it }, lp(14))
+            addView(modelBlock("3) MI-GAN — ลบตัวอักษรเดิม", ModelStore.INP, Prefs.inpUrl, "URL MI-GAN .onnx (แบบ pipeline อินพุต uint8)",
+                "เติมพื้นหลังกรอบแทนการวางสีทึบทับ (ไม่มีโมเดล = ใช้สีทึบเหมือนเดิม)", Prefs.useInpaint) { Prefs.useInpaint = it }, lp(14))
         }
 
         val glossary = card {
@@ -300,25 +301,64 @@ class MainActivity : Activity() {
 
     private fun save() {
         Prefs.glossary = gl.text.toString()
-        Prefs.modelUrl = modelUrlBox.text.toString()
+        for (r in modelRows) when (r.spec.id) {
+            "rec" -> Prefs.modelUrl = r.urlBox.text.toString()
+            "det" -> Prefs.detUrl = r.urlBox.text.toString()
+            "inp" -> Prefs.inpUrl = r.urlBox.text.toString()
+        }
         Prefs.llmKey = llmKeyBox.text.toString(); Prefs.llmModel = llmModelBox.text.toString(); Prefs.llmBase = llmBaseBox.text.toString()
     }
 
-    private fun refreshModel() {
-        modelOut.text = if (PpRec.installed(this)) "✓ ติดตั้งแล้ว (${PpRec.file(this).length() / 1024 / 1024} MB)" else "ยังไม่ได้โหลดโมเดล"
+    private fun modelBlock(title: String, spec: ModelStore.Spec, url: String, hint: String, desc: String, on: Boolean, set: (Boolean) -> Unit): View {
+        val box = field(EditText(this).apply { this.hint = hint; setSingleLine(); setText(url) })
+        val out = tv("", 13f, TXT).apply { setPadding(0, dp(8), 0, 0) }
+        val row = ModelRow(spec, box, out); modelRows.add(row)
+        val idx = modelRows.size - 1
+        refreshModel(row)
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(tv(title, 14f, TXT, true))
+            addView(toggleRow("ใช้งาน", desc, on, set))
+            addView(box, lp(6))
+            val btns = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.HORIZONTAL }
+            btns.addView(button("โหลดจาก URL", 0xFF374151.toInt()) { downloadModel(row) }, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(6) })
+            btns.addView(button("เลือกไฟล์", 0xFF374151.toInt()) { pickModel(idx) }, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(6) })
+            addView(btns, lp(8))
+            addView(out)
+        }
     }
 
-    private fun downloadModel() {
-        save(); modelOut.text = "กำลังโหลด 0%"
-        val app = applicationContext; val url = Prefs.modelUrl
+    private fun refreshModel(r: ModelRow) {
+        val f = ModelStore.file(this, r.spec)
+        r.out.text = if (ModelStore.installed(this, r.spec)) "✓ ติดตั้งแล้ว (${"%.1f".format(f.length() / 1048576.0)} MB)" else "ยังไม่ได้ติดตั้ง"
+    }
+
+    private fun pickModel(idx: Int) {
+        save()
+        val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type = "*/*" }
+        try { startActivityForResult(i, reqImport + idx) } catch (e: Exception) { Toast.makeText(this, "เปิดตัวเลือกไฟล์ไม่ได้", Toast.LENGTH_SHORT).show() }
+    }
+
+    /** ตรวจว่าไฟล์โหลดเข้า ONNX Runtime ได้จริง แล้วรายงานผลบนการ์ด */
+    private fun finishModel(r: ModelRow, err: String?) {
+        val app = applicationContext
         Thread {
-            val err = PpRec.download(app, url) { p -> runOnUiThread { if (!isDestroyed) modelOut.text = "กำลังโหลด $p%" } }
-            val ok = err == null && PpRec.load(app)
+            val ok = err == null && ModelStore.load(app, r.spec)
             runOnUiThread {
                 if (isDestroyed) return@runOnUiThread
-                modelOut.text = if (ok) "✓ โหลดและพร้อมใช้ (หยุดแล้วเริ่มบริการใหม่เพื่อใช้ในหน้าที่กำลังแปล)"
-                                else "ผิดพลาด: ${err ?: PpRec.lastErr}"
+                if (ok) { refreshModel(r); r.out.text = r.out.text.toString() + " — พร้อมใช้ (หยุดแล้วเริ่มบริการใหม่เพื่อใช้ในหน้าที่กำลังแปล)" }
+                else r.out.text = "ผิดพลาด: ${err ?: ModelStore.lastErr(r.spec)}"
             }
+        }.start()
+    }
+
+    private fun downloadModel(r: ModelRow) {
+        save(); r.out.text = "กำลังโหลด 0%"
+        val app = applicationContext
+        val url = when (r.spec.id) { "rec" -> Prefs.modelUrl; "det" -> Prefs.detUrl; else -> Prefs.inpUrl }
+        Thread {
+            val err = ModelStore.download(app, r.spec, url) { p -> runOnUiThread { if (!isDestroyed) r.out.text = "กำลังโหลด $p%" } }
+            runOnUiThread { if (!isDestroyed) finishModel(r, err) }
         }.start()
     }
 
@@ -405,6 +445,18 @@ class MainActivity : Activity() {
     @Deprecated("ok")
     override fun onActivityResult(r: Int, c: Int, d: Intent?) {
         super.onActivityResult(r, c, d)
+        if (r >= reqImport && r < reqImport + modelRows.size) {
+            val row = modelRows[r - reqImport]; val uri = d?.data
+            if (c == RESULT_OK && uri != null) {
+                row.out.text = "กำลังนำเข้า..."
+                val app = applicationContext
+                Thread {
+                    val err = ModelStore.importFrom(app, row.spec, uri)
+                    runOnUiThread { if (!isDestroyed) finishModel(row, err) }
+                }.start()
+            }
+            return
+        }
         if (r != reqCap) return
         if (c == RESULT_OK && d != null) {
             startForegroundService(Intent(this, OverlayService::class.java).putExtra("code", c).putExtra("data", d))

@@ -4,7 +4,7 @@ android {
     compileSdk = 35
     defaultConfig {
         applicationId = "com.sunmind.mangaoverlay"
-        minSdk = 26; targetSdk = 34; versionCode = 11; versionName = "3.8"
+        minSdk = 26; targetSdk = 34; versionCode = 12; versionName = "3.9"
         ndk { abiFilters += "arm64-v8a" }
     }
     // keystore คงที่ ทำให้ APK จากทุก build ลงทับกันได้ (ไม่ต้องถอนการติดตั้งก่อน)

@@ -52,6 +52,24 @@ object Prefs {
         get() = sp.getString("modelurl", "") ?: ""
         set(v) { sp.edit().putString("modelurl", v.trim()).apply() }
 
+    /** ใช้ YOLOv8n-bubble หากรอบคำพูด (ช่วยรวมข้อความกรอบเดียวกัน + ขอบเขตกล่องคำแปล) */
+    var useDet: Boolean
+        get() = sp.getBoolean("usedet", true)
+        set(v) { sp.edit().putBoolean("usedet", v).apply() }
+
+    var detUrl: String
+        get() = sp.getString("deturl", "") ?: ""
+        set(v) { sp.edit().putString("deturl", v.trim()).apply() }
+
+    /** ใช้ MI-GAN ลบข้อความเดิมแล้วเติมพื้นหลัง แทนการวางสีพื้นทึบทับ */
+    var useInpaint: Boolean
+        get() = sp.getBoolean("useinp", true)
+        set(v) { sp.edit().putBoolean("useinp", v).apply() }
+
+    var inpUrl: String
+        get() = sp.getString("inpurl", "") ?: ""
+        set(v) { sp.edit().putString("inpurl", v.trim()).apply() }
+
     var glossary: String
         get() = if (::sp.isInitialized) sp.getString("glossary", "") ?: "" else ""
         set(v) { sp.edit().putString("glossary", v).apply() }
