@@ -118,6 +118,24 @@ int main(int argc, char** argv) {
     // บรรทัดสะอาดทั้งหมดต้องได้คะแนนสูง (กันกู้ผิดพลาดกับข้อความจริง), ข้อความที่สร้างจากพยัญชนะสุ่มต้องต่ำ
     { int lowClean = 0; for (const char* c : kClean) if (!(sp(c) >= 0.75f)) { ++lowClean; std::printf("  LOW SPELL: %s = %.2f\n", c, sp(c)); } if (lowClean) ++fails; }
     { std::mt19937 r2(7); int hiJunk = 0; for (int i = 0; i < 500; ++i) { std::string j; const int nw = 2 + r2() % 3; for (int w = 0; w < nw; ++w) { if (w) j += ' '; const int L = 3 + r2() % 5; for (int k = 0; k < L; ++k) j.push_back("bcdfgjklmnpqvwxz"[r2() % 16]); } if (sp(j.c_str()) >= 0.75f) { ++hiJunk; std::printf("  JUNK PASSED: %s\n", j.c_str()); } } std::printf("random junk rescued: %d/500\n", hiJunk); if (hiJunk > 0) ++fails; }
+    // --- เติมตัวอักษรที่ถูกบัง (กรณีจริง: SLIMOPOLIS ถูกกรงเล็บบัง อ่านได้ "SLIMEP LIS") ---
+    { const std::vector<std::string> sl = {"slimopolis"};
+      eq("(THE DOCK DISTRICT OF SLIMEP LIS IS LIBERATED)", "(THE DOCK DISTRICT OF SLIMOPOLIS IS LIBERATED)", sl);   // E<->O สับสน + ขาด O
+      eq("THE DOCK DISTRICT OF SLIMOP LIS IS LIBERATED", "THE DOCK DISTRICT OF SLIMOPOLIS IS LIBERATED", sl);       // ขาด O ตรงรอยต่อ
+      eq("SLIMOP?LIS", "SLIMOPOLIS", sl);                 // มีสัญลักษณ์แทนที่รอยบัง
+      eq("SLIMEPLIS", "SLIMOPOLIS", sl);                  // คำเดียว
+      eq("SLIMOPOLI", "SLIMOPOLIS", sl);                  // ท้ายคำถูกบัง
+      eq("slimop lis", "slimopolis", sl);
+      eq("Slimep Lis", "Slimopolis", sl);
+      eq("SLIMOPOLIS", "SLIMOPOLIS", sl);                 // อ่านครบอยู่แล้ว: ไม่แตะ
+      eq("SLIMEP LIS", "SLIMEP LIS");                     // ไม่มีศัพท์: ไม่เดา
+      eq("WE WILL BE SLIM OR NOT", "WE WILL BE SLIM OR NOT", sl);    // คำจริงที่ติดกันไม่ถูกรวม
+      eq("THE POLIS IS HERE", "THE POLIS IS HERE", sl);
+      eq("SLIMEPOLIS", "SLIMOPOLIS", {"slimopolis", "slimxxxxxx"});
+      eq("SLIMEPOLIS", "SLIMEPOLIS", {"slimopolis", "slimcpolis"});  // เสมอกัน (e<->o, e<->c) = ไม่เดา
+      if (!(sp("SLIMEP LIS", sl) >= 0.75f) || sp("SLIMEP LIS") >= 0.75f) { std::puts("FAIL spell-gap"); ++fails; }
+    }
+    // ไม่มีศัพท์ผู้ใช้: ห้ามเติมจากพจนานุกรมจนชื่อเพี้ยน (LUFFY->FLUFFY) — ครอบด้วย kNames ด้านล่างอยู่แล้ว
     // ข้อความยาวผิดปกติ/ไบต์แปลก ไม่ crash และไม่เปลี่ยน
     { std::string big(30000, 'x'); if (G.fix(big) != big) { std::puts("FAIL big"); ++fails; } }
     { std::string bin; for (int i = 0; i < 4000; ++i) bin.push_back((char)(i * 37 % 256)); (void)G.fix(bin); (void)G.plausibility(bin); }

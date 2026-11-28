@@ -107,6 +107,8 @@ object Ocr {
             if (junkRe.containsMatchIn(s)) continue // ลายน้ำ/URL
             // แทบไม่มีคำอังกฤษที่รู้จักเลย + OCR ไม่มั่นใจ = ลายเส้น/สัญลักษณ์ ไม่ใช่บทพูด
             if ((if (kept.isEmpty()) 1.0 else kept.map { it.confidence }.average()) < 0.6 && Guess.plausibility(s) in 0f..0.15f) continue
+            // บล็อกที่ทุกบรรทัดอ่านชัด (>=0.85) = แหล่งเรียนรู้ชื่อ/ศัพท์ ไว้เติมเมื่อถูกบังภายหลัง
+            if (kept.size == b.lines.size && kept.all { it.confidence >= 0.85f }) Guess.learn(s)
             val hs = lines.mapNotNull { it.boundingBox?.height() }.sorted()
             raw.add(Blk(Rect(bb), s, if (hs.isEmpty()) bb.height() else hs[hs.size / 2]))
         }

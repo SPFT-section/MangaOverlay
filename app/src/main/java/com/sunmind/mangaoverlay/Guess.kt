@@ -37,11 +37,29 @@ object Guess {
         return out.toByteArray()
     }
 
-    // คำในศัพท์เฉพาะของผู้ใช้ (ชื่อตัวละคร ฯลฯ) ห้ามถูกแก้
+    // คำที่ห้ามแตะ/ใช้เติมตัวอักษรที่ถูกบัง = ศัพท์เฉพาะของผู้ใช้ (glossary) + คำที่เคยอ่านชัดเจนแล้วในเซสชันนี้ (ชื่อเมือง/ตัวละครที่โผล่ซ้ำ)
+    private val session = LinkedHashSet<String>()
+    @Volatile private var sVer = 0
+    @Volatile private var pSv = -1
+
+    /** จำคำยาว >=6 ตัวอักษรจากข้อความที่ OCR มั่นใจสูง ไว้เติมตอนที่ภายหลังคำเดียวกันถูกบังบางส่วน (เก็บล่าสุด 400 คำ) */
+    fun learn(text: String) {
+        synchronized(session) {
+            for (m in LEARN_RE.findAll(text)) {
+                if (session.add(m.value.lowercase())) {
+                    sVer++
+                    if (session.size > 400) session.remove(session.first())
+                }
+            }
+        }
+    }
+
     private fun protect(): String {
         val g = Prefs.glossary
-        if (g != pKey) {
-            pVal = g.lines().mapNotNull { l -> l.substringBefore('=', "").trim().takeIf { it.isNotEmpty() } }.joinToString("\n")
+        if (g != pKey || sVer != pSv) {
+            val user = g.lines().mapNotNull { l -> l.substringBefore('=', "").trim().takeIf { it.isNotEmpty() } }
+            val learned = synchronized(session) { pSv = sVer; session.toList() }
+            pVal = (user + learned).joinToString("\n")
             pKey = g
         }
         return pVal
@@ -57,4 +75,5 @@ object Guess {
         line.count { it in 'a'..'z' || it in 'A'..'Z' } >= 3 && Native.guessSpell(line, protect()) >= RESCUE_SPELL
 
     const val RESCUE_SPELL = 0.75f
+    private val LEARN_RE = Regex("[A-Za-z]{6,24}")
 }

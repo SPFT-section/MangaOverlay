@@ -272,6 +272,84 @@ bool WordGuess::correct(const std::string& s, bool allCaps, const std::unordered
     return out != s;
 }
 
+// ---------- เติมตัวอักษรที่ถูกบัง (occlusion) ----------
+// คู่ตัวอักษรที่ OCR สับสนเมื่อเห็นไม่ครบ (ตัวพิมพ์เล็ก)
+static bool confus(char a, char b) {
+    static const char* const P[] = {"eo", "co", "ce", "ao", "il", "uv", "bh", "nh", "gq"};
+    for (const char* p : P) if ((a == p[0] && b == p[1]) || (a == p[1] && b == p[0])) return true;
+    return false;
+}
+
+// s = สิ่งที่ OCR เห็น, w = คำเป้าหมาย: ข้ามตัวอักษรของ w ได้ (ถูกบัง) ราคา 1, แทนด้วยคู่สับสนราคา 1, ตัวอื่นไม่ยอม; 99 = ไม่ตรง
+static int gapAlign(const std::string& s, const std::string& w) {
+    const size_t m = s.size(), n = w.size();
+    std::vector<std::vector<int>> dp(m + 1, std::vector<int>(n + 1, 99));
+    dp[0][0] = 0;
+    for (size_t i = 0; i <= m; ++i) for (size_t j = 0; j <= n; ++j) {
+        const int d = dp[i][j]; if (d >= 99) continue;
+        if (j < n && dp[i][j + 1] > d + 1) dp[i][j + 1] = d + 1;
+        if (i < m && j < n) {
+            if (s[i] == w[j]) { if (dp[i + 1][j + 1] > d) dp[i + 1][j + 1] = d; }
+            else if (confus(s[i], w[j]) && dp[i + 1][j + 1] > d + 1) dp[i + 1][j + 1] = d + 1;
+        }
+    }
+    return dp[m][n];
+}
+
+static bool alphaTok(const std::string& text, const Tok& t) {
+    for (size_t i = t.b; i < t.e; ++i) if (!isLetter(static_cast<unsigned char>(text[i]))) return false;
+    return true;
+}
+// ตัวคั่นที่เป็นรอยบัง: เว้นวรรค/สัญลักษณ์แทนที่ (ไม่รวมจุด เพราะเป็นจบประโยค)
+static bool gapSep(const std::string& text, size_t b, size_t e) {
+    if (e <= b) return false;
+    for (size_t i = b; i < e; ++i) if (std::string(" ?_*#~").find(text[i]) == std::string::npos) return false;
+    return true;
+}
+
+bool WordGuess::gapMatch(const std::string& s, bool title, const std::unordered_set<std::string>& pr, std::string& out, bool useDict) const {
+    const size_t m = s.size();
+    if (m < 4 || m > 24 || known(s, pr)) return false;
+    std::string best; int bestC = 99; bool tie = false;
+    auto consider = [&](const std::string& w, size_t maxSkip) {
+        if (w.size() < 6 || w.size() < m || w.size() - m > maxSkip) return;
+        const int skips = static_cast<int>(w.size() - m);
+        const int c = gapAlign(s, w);
+        if (c >= 99 || c - skips > 1) return;                 // แทนตัวอักษรได้ไม่เกิน 1 ตัว
+        if (c < bestC) { bestC = c; best = w; tie = false; }
+        else if (c == bestC && w != best) tie = true;
+    };
+    for (const auto& w : pr) consider(w, 2);                  // ศัพท์ผู้ใช้/ชื่อที่เคยอ่านชัด: ขาดได้ 2 ตัว
+    if (useDict && best.empty() && !title && m >= 5) for (const auto& kv : lg_) if (kv.second >= 3.0f) consider(kv.first, 1);   // พจนานุกรม: ขาด 1 ตัว ไม่แตะชื่อ (Title)
+    if (best.empty() || tie) return false;
+    out = best; return true;
+}
+
+std::string WordGuess::fillGaps(const std::string& text, const std::unordered_set<std::string>& pr, bool caps) const {
+    const auto toks = tokenize(text);
+    std::string res; size_t pos = 0;
+    for (size_t i = 0; i < toks.size(); ++i) {
+        const Tok& t = toks[i];
+        if (t.b < pos || t.edge || !alphaTok(text, t)) continue;
+        const std::string a = lower(text.substr(t.b, t.e - t.b));
+        if (known(a, pr)) continue;
+        const Pat pat = patternOf(text.substr(t.b, t.e - t.b), caps);
+        std::string o;
+        if (i + 1 < toks.size()) {
+            const Tok& u = toks[i + 1];
+            if (!u.edge && alphaTok(text, u) && gapSep(text, t.e, u.b)) {
+                const std::string b = lower(text.substr(u.b, u.e - u.b));
+                if (gapMatch(a + b, pat == Pat::Title, pr, o, false)) {
+                    res.append(text, pos, t.b - pos); res += applyCase(o, pat); pos = u.e; ++i; continue;
+                }
+            }
+        }
+        if (gapMatch(a, pat == Pat::Title, pr, o, false)) { res.append(text, pos, t.b - pos); res += applyCase(o, pat); pos = t.e; }
+    }
+    res.append(text, pos, std::string::npos);
+    return res;
+}
+
 std::string WordGuess::fix(const std::string& text, const std::vector<std::string>& protect) const {
     if (!ready() || text.empty() || text.size() > 20000) return text;
     std::unordered_set<std::string> pr;
@@ -329,7 +407,7 @@ std::string WordGuess::fix(const std::string& text, const std::vector<std::strin
         pos = sg.e;
     }
     res.append(text, pos, std::string::npos);
-    return res;
+    return fillGaps(res, pr, caps);
 }
 
 float WordGuess::plausibility(const std::string& text, const std::vector<std::string>& protect) const {
@@ -362,7 +440,11 @@ float WordGuess::spellScore(const std::string& text, const std::vector<std::stri
     for (const auto& p : protect) pr.insert(lower(p));
     const bool caps = isAllCaps(text);
     int n = 0, k = 0, longOk = 0;
-    for (const auto& t : tokenize(text)) {
+    const auto toks = tokenize(text);
+    bool skipNext = false;
+    for (size_t ti = 0; ti < toks.size(); ++ti) {
+        const Tok& t = toks[ti];
+        if (skipNext) { skipNext = false; continue; }
         if (t.edge) continue;                              // ติดอักขระนอก ASCII (ไทย/ญี่ปุ่น) = ไม่ใช่ภาษาอังกฤษล้วน ไม่ตัดสิน
         const std::string tok = text.substr(t.b, t.e - t.b);
         std::string w;
@@ -375,6 +457,15 @@ float WordGuess::spellScore(const std::string& text, const std::vector<std::stri
         bool ok = known(w, pr);
         if (!ok) for (const auto& c : kContr) if (w == c.from) ok = true;
         if (!ok && w.size() >= 4) { std::string o; if (correct(tok, caps, pr, o)) { std::string lo; for (char c : o) if (c != '\'') lo.push_back(lowc(c)); ok = known(lo, pr); } }
+        if (!ok && alphaTok(text, t)) {                      // ถูกบัง: เติมจากศัพท์ผู้ใช้/พจนานุกรมได้ไหม (รวมคู่ "SLIMEP LIS")
+            std::string o; const bool title = patternOf(tok, caps) == Pat::Title;
+            if (ti + 1 < toks.size() && !toks[ti + 1].edge && alphaTok(text, toks[ti + 1]) && gapSep(text, t.e, toks[ti + 1].b)) {
+                const Tok& u = toks[ti + 1];
+                const std::string b = lower(text.substr(u.b, u.e - u.b));
+                if (gapMatch(w + b, title, pr, o, true)) { ok = true; skipNext = true; }
+            }
+            if (!ok && gapMatch(w, title, pr, o, true)) ok = true;
+        }
         if (ok) { ++k; if (w.size() >= 3) ++longOk; }
     }
     if (n == 0) return -1.f;

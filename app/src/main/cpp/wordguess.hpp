@@ -34,6 +34,10 @@ private:
     bool known(const std::string& w, const std::unordered_set<std::string>& pr) const;
     bool correct(const std::string& tok, bool allCaps, const std::unordered_set<std::string>& pr, std::string& out) const;
     bool best(const std::string& lw, bool allCaps, std::string& out) const;
+    /// เติมตัวอักษรที่ถูกบัง: s (ตัวพิมพ์เล็ก ไม่มีเว้นวรรค) ตรงกับคำเป้าหมายโดยขาดไป <=2 ตัว + แทนด้วยคู่ที่ OCR สับสน <=1 ตัว
+    /// ศัพท์ผู้ใช้/ชื่อที่เคยอ่านชัดแล้ว (pr) มาก่อน; useDict=true ใช้พจนานุกรมด้วย (เฉพาะประเมินคะแนนสะกด ห้ามใช้แก้ข้อความ: ชื่ออย่าง LUFFY จะกลายเป็น FLUFFY); ต้องเป็นคำเดียวที่ดีที่สุดเท่านั้น (เสมอกัน = ไม่แก้)
+    bool gapMatch(const std::string& s, bool title, const std::unordered_set<std::string>& pr, std::string& out, bool useDict) const;
+    std::string fillGaps(const std::string& text, const std::unordered_set<std::string>& pr, bool caps) const;
 };
 
 }  // namespace mo
