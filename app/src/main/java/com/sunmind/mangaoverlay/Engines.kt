@@ -1,10 +1,6 @@
 package com.sunmind.mangaoverlay
 
 import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.ColorMatrix
-import android.graphics.ColorMatrixColorFilter
-import android.graphics.Paint
 import android.graphics.Color
 import android.graphics.Rect
 import android.util.LruCache
@@ -121,53 +117,65 @@ object Ocr {
         return ws.count { w -> w.length <= 2 || w.lowercase() in stop || Dict.lookup(w) != null }.toFloat() / ws.size
     }
 
-    /** ตัดบล็อกมา ขยาย 3 เท่า + เพิ่มคอนทราสต์ (ปกติ/กลับสี) แล้ว OCR ซ้ำ — ฟอนต์แคบ/ตัวอักษรบนพื้นสี ๆ อ่านได้ดีขึ้นมาก */
-    private fun prep(src: Bitmap, r: Rect, invert: Boolean): Bitmap? {
-        val x0 = max(0, r.left - 8); val y0 = max(0, r.top - 8)
-        val x1 = min(src.width, r.right + 8); val y1 = min(src.height, r.bottom + 8)
-        val cw = x1 - x0; val ch = y1 - y0
-        if (cw < 8 || ch < 8) return null
-        val sc = min(3f, 2400f / max(cw, ch)); if (sc < 1.2f) return null
-        val out = Bitmap.createBitmap((cw * sc).toInt(), (ch * sc).toInt(), Bitmap.Config.ARGB_8888)
-        val c = 1.6f; val t = (1f - c) * 127.5f
-        val k = if (invert) -c else c; val o = if (invert) 255f - t else t
-        val cm = ColorMatrix(floatArrayOf(
-            k * .299f, k * .587f, k * .114f, 0f, o,
-            k * .299f, k * .587f, k * .114f, 0f, o,
-            k * .299f, k * .587f, k * .114f, 0f, o,
-            0f, 0f, 0f, 1f, 0f))
-        val paint = Paint(Paint.FILTER_BITMAP_FLAG).apply { colorFilter = ColorMatrixColorFilter(cm) }
-        Canvas(out).drawBitmap(src, Rect(x0, y0, x1, y1), Rect(0, 0, out.width, out.height), paint)
-        return out
+    /** ความคล้ายกันของสองข้อความ 0..1 (ใช้โหวตระหว่างผลอ่านหลายแบบ) */
+    private fun sim(a: String, b: String): Float {
+        val x = a.lowercase().filter { it.isLetterOrDigit() }; val y = b.lowercase().filter { it.isLetterOrDigit() }
+        val m = max(x.length, y.length); if (m == 0) return 1f
+        return 1f - min(1f, Spell.cost(x, y, m.toFloat()) / m)
     }
 
+    private class Cand(val text: String, val conf: Float)
+
+    private fun crop(src: Bitmap, r: Rect): Triple<IntArray, Int, Int>? {
+        val x0 = max(0, r.left - 6); val y0 = max(0, r.top - 6); val x1 = min(src.width, r.right + 6); val y1 = min(src.height, r.bottom + 6)
+        val cw = x1 - x0; val ch = y1 - y0
+        if (cw < 8 || ch < 8) return null
+        val px = IntArray(cw * ch); src.getPixels(px, 0, cw, x0, y0, cw, ch)
+        return Triple(px, cw, ch)
+    }
+
+    /**
+     * OCR ซ้ำด้วยภาพที่เราแยกตัวอักษรออกจากพื้นเอง (Bin.variants) หลายแบบ แล้วโหวต:
+     * คะแนน = สัดส่วนคำจริง + มั่นใจของ OCR + ความสอดคล้องกับผลแบบอื่น ; จากนั้นแก้คำเพี้ยนด้วย Spell
+     */
     private suspend fun refine(bmp: Bitmap, bl: List<Blk>): List<Blk> {
-        var budget = 6
+        var budget = 5
         val out = ArrayList<Blk>(bl.size)
         for (b in bl) {
             val s0 = score(b.text)
             if (budget <= 0 || (b.conf >= 0.85f && s0 >= 0.6f)) { out.add(b); continue }
             budget--
-            var best = b; var bs = s0 + b.conf * 0.5f
-            for (inv in booleanArrayOf(false, true)) {
-                val pb = prep(bmp, b.r, inv) ?: continue
-                val t2 = try { rec.process(InputImage.fromBitmap(pb, 0)).await() }
-                         catch (e: CancellationException) { throw e } catch (e: Exception) { null }
-                pb.recycle()
-                if (t2 == null) continue
-                val ls = t2.textBlocks.flatMap { it.lines }
-                if (ls.isEmpty()) continue
-                val s = clean(t2.textBlocks.joinToString(" ") { it.text })
-                if (s.isBlank() || junkRe.containsMatchIn(s)) continue
-                val c = ls.map { it.confidence }.average().toFloat()
-                val sc = score(s) + c * 0.5f
-                if (sc > bs + 0.05f) { bs = sc; best = Blk(b.r, s, b.lh, c) }
-                if (score(best.text) >= 0.7f && best.conf >= 0.8f) break
+            val cr = crop(bmp, b.r)
+            val cands = arrayListOf(Cand(b.text, b.conf))
+            if (cr != null) {
+                val sc = (96f / max(cr.third, 1)).toInt().coerceIn(2, 4)   // ให้ตัวอักษรสูงราว 100px+ ซึ่งเป็นช่วงที่ OCR อ่านดีที่สุด
+                for (v in Bin.variants(cr.first, cr.second, cr.third, sc)) {
+                    val pb = try { Bitmap.createBitmap(v.px, v.w, v.h, Bitmap.Config.ARGB_8888) } catch (e: Exception) { continue }
+                    val t2 = try { rec.process(InputImage.fromBitmap(pb, 0)).await() }
+                             catch (e: CancellationException) { throw e } catch (e: Exception) { null }
+                    pb.recycle()
+                    if (t2 == null) continue
+                    val ls = t2.textBlocks.flatMap { it.lines }
+                    if (ls.isEmpty()) continue
+                    val s = clean(t2.textBlocks.joinToString(" ") { it.text })
+                    if (s.isBlank() || junkRe.containsMatchIn(s)) continue
+                    cands.add(Cand(s, ls.map { it.confidence }.average().toFloat()))
+                    if (cands.size >= 3 && score(s) >= 0.8f && cands.last().conf >= 0.8f) break
+                }
             }
-            out.add(best)
+            val best = cands.maxByOrNull { c ->
+                val agree = if (cands.size > 1) cands.filter { it !== c }.map { sim(c.text, it.text) }.average().toFloat() else 0f
+                score(c.text) + 0.5f * c.conf + 0.5f * agree
+            }!!
+            out.add(Blk(b.r, spellFix(best.text), b.lh, best.conf))
         }
         // ยังเป็นขยะหลังอ่านซ้ำ (หลายคำ ไม่ใช่คำจริงเป็นส่วนใหญ่ มั่นใจต่ำ) = ไม่แปล ดีกว่าแสดงคำแปลมั่ว
         return out.filter { b -> !(Dict.ready() && wordRe.findAll(b.text).count() >= 3 && score(b.text) < 0.4f && b.conf < 0.75f) }
+    }
+
+    private fun spellFix(s: String): String {
+        if (!Dict.ready()) return s
+        return Spell.fix(s, { w -> w.length <= 2 || w.lowercase() in stop || Dict.lookup(w) != null }, Dict.vocab(), stop)
     }
 
     private fun toItem(img: Img, b: Blk, text: String): Item {
@@ -405,6 +413,9 @@ object Dict {
         map = m
     }
     fun ready() = map != null
+    @Volatile private var vocabList: List<String>? = null
+    /** คำเดี่ยวตัวอักษรล้วนจากพจนานุกรม ใช้เป็นคลังคำของ Spell (สร้างครั้งเดียว) */
+    fun vocab(): List<String> = vocabList ?: (map?.keys?.filter { k -> k.length in 3..14 && k.all { it in 'a'..'z' } } ?: emptyList()).also { if (it.isNotEmpty()) vocabList = it }
 
     /** คืนคำแปลทั้งหมดของคำเดียว (คั่นด้วย ;) รวมการแปลงรูปคำ -s -ed -ing */
     fun lookup(word: String): String? {
