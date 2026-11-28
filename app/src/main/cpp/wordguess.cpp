@@ -355,4 +355,30 @@ float WordGuess::plausibility(const std::string& text, const std::vector<std::st
     return static_cast<float>(k) / static_cast<float>(n);
 }
 
+// หมายเหตุ: คำที่ "แก้ด้วยกฎ OCR" นับเป็นสะกดถูกเฉพาะคำยาว >=4 ตัว (คำสั้น 3 ตัวแก้ได้ง่ายเกิน: nnl->nil ทำให้ขยะผ่าน)
+float WordGuess::spellScore(const std::string& text, const std::vector<std::string>& protect) const {
+    if (!ready() || text.empty() || text.size() > 20000) return -1.f;
+    std::unordered_set<std::string> pr;
+    for (const auto& p : protect) pr.insert(lower(p));
+    const bool caps = isAllCaps(text);
+    int n = 0, k = 0, longOk = 0;
+    for (const auto& t : tokenize(text)) {
+        if (t.edge) continue;                              // ติดอักขระนอก ASCII (ไทย/ญี่ปุ่น) = ไม่ใช่ภาษาอังกฤษล้วน ไม่ตัดสิน
+        const std::string tok = text.substr(t.b, t.e - t.b);
+        std::string w;
+        bool alpha = true;
+        for (char c : tok) { if (c == '\'') continue; if (!isLetter(static_cast<unsigned char>(c))) { alpha = false; break; } w.push_back(lowc(c)); }
+        if (!alpha || w.size() < 2) continue;              // มีตัวเลข/สัญลักษณ์ปนหรือตัวเดี่ยว: ไม่ใช้ตัดสิน
+        ++n;
+        bool same = w.size() >= 3; for (char c : w) if (c != w[0]) same = false;
+        if (same) continue;                                // III lll ooo = เส้น/ลายที่ OCR อ่านเป็นตัวอักษร
+        bool ok = known(w, pr);
+        if (!ok) for (const auto& c : kContr) if (w == c.from) ok = true;
+        if (!ok && w.size() >= 4) { std::string o; if (correct(tok, caps, pr, o)) { std::string lo; for (char c : o) if (c != '\'') lo.push_back(lowc(c)); ok = known(lo, pr); } }
+        if (ok) { ++k; if (w.size() >= 3) ++longOk; }
+    }
+    if (n == 0) return -1.f;
+    return longOk == 0 ? 0.f : static_cast<float>(k) / static_cast<float>(n);
+}
+
 }  // namespace mo

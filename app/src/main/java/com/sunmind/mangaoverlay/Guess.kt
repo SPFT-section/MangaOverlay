@@ -51,4 +51,10 @@ object Guess {
 
     /** -1f = ไม่ทราบ */
     fun plausibility(s: String): Float = Native.guessPlausible(s, protect())
+
+    /** บรรทัดที่ OCR มั่นใจต่ำ "กู้" ได้ไหม: ต้องมีตัวอักษรละติน >=3 และสะกดถูกตามพจนานุกรม >=75% (ใช้เนทีฟไม่ได้/ไม่แน่ใจ = ไม่กู้ เหมือนพฤติกรรมเดิม) */
+    fun rescuable(line: String): Boolean =
+        line.count { it in 'a'..'z' || it in 'A'..'Z' } >= 3 && Native.guessSpell(line, protect()) >= RESCUE_SPELL
+
+    const val RESCUE_SPELL = 0.75f
 }

@@ -158,4 +158,15 @@ JNIEXPORT jfloat JNICALL Java_com_sunmind_mangaoverlay_Native_nGuessPlausible(JN
     } catch (...) { return -1.f; }
 }
 
+JNIEXPORT jfloat JNICALL Java_com_sunmind_mangaoverlay_Native_nGuessSpell(JNIEnv* env, jclass, jstring text, jstring protect) {
+    const auto g = guessInstance();
+    if (!g) return -1.f;
+    try {
+        std::string in, pr;
+        if (!utf(env, text, in)) return -1.f;
+        utf(env, protect, pr);
+        return g->spellScore(in, splitLines(pr));
+    } catch (...) { return -1.f; }
+}
+
 }  // extern "C"

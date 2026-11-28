@@ -23,6 +23,10 @@ public:
     /// สัดส่วนคำ (>=3 ตัวอักษร) ที่เป็นคำรู้จัก 0..1; -1 = ข้อมูลน้อยเกินตัดสิน (< 3 คำ)
     float plausibility(const std::string& text, const std::vector<std::string>& protect = {}) const;
 
+    /// คะแนนการสะกดของบรรทัดเดียว 0..1: สัดส่วนคำ (>=2 ตัวอักษร) ที่ "สะกดถูก" = อยู่ในพจนานุกรม/ศัพท์ผู้ใช้ หรือแก้ด้วยกฎ OCR แล้วได้คำในพจนานุกรม
+    /// ตัวอักษรซ้ำล้วน (III, lll, ooo) นับเป็นขยะ; ต้องมีคำถูกอย่างน้อยหนึ่งคำยาว >=3 ตัวอักษร ไม่งั้นได้ 0; -1 = ไม่มีคำให้ตัดสิน
+    float spellScore(const std::string& line, const std::vector<std::string>& protect = {}) const;
+
 private:
     std::unordered_map<std::string, float> lg_;      // คำ -> log10(ความถี่)
     std::unordered_set<std::string> extra_;          // อุทาน/คำญี่ปุ่นที่พบบ่อยในมังงะ

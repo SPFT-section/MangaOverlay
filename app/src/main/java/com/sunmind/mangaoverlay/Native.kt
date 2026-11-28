@@ -19,6 +19,8 @@ object Native {
     @JvmStatic private external fun nGuessFix(text: String, protect: String): String?
     @JvmStatic private external fun nGuessPlausible(text: String, protect: String): Float
 
+    @JvmStatic private external fun nGuessSpell(text: String, protect: String): Float
+
     @Volatile var guessReady = false; private set
 
     private inline fun <T> guard(f: () -> T?): T? = if (!ok) null else try { f() } catch (e: Throwable) { ok = false; null }
@@ -55,4 +57,7 @@ object Native {
 
     /** 0..1 สัดส่วนคำที่เป็นคำอังกฤษรู้จัก, -1 = ไม่ทราบ/ข้อมูลน้อย */
     fun guessPlausible(text: String, protect: String): Float = guardG { nGuessPlausible(text, protect) } ?: -1f
+
+    /** คะแนนการสะกดของหนึ่งบรรทัด 0..1 (อิงพจนานุกรม), -1 = ไม่ทราบ/ไม่มีคำให้ตัดสิน */
+    fun guessSpell(text: String, protect: String): Float = guardG { nGuessSpell(text, protect) } ?: -1f
 }
