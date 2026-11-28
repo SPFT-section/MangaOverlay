@@ -15,6 +15,14 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Native tests (C++ ASan/UBSan)
+        shell: bash
+        run: |
+          set -e
+          I=app/src/main/cpp; F="-std=c++17 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=all -I $I"
+          g++ $F native-tests/calc_test.cpp $I/calc.cpp -o /tmp/calc_test && /tmp/calc_test
+          g++ $F native-tests/guess_test.cpp $I/wordguess.cpp -o /tmp/guess_test && /tmp/guess_test app/src/main/assets/freq_en.txt
+          /tmp/guess_test app/src/main/assets/freq_en.txt app/src/main/assets/dict_en_th.tsv
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: 17 }
       - uses: gradle/actions/setup-gradle@v4

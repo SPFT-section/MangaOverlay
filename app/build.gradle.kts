@@ -17,6 +17,7 @@ android {
     buildTypes { getByName("debug") { signingConfig = signingConfigs.getByName("debug") } }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     kotlinOptions { jvmTarget = "17" }
+    externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt") } }
 }
 dependencies {
     implementation("com.google.mlkit:text-recognition:16.0.1")

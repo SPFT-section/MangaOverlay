@@ -1,3 +1,5 @@
 Thai WordNet Copyright 2011 by the National Institute of Information and Communications Technology (NICT). All rights reserved. Provided AS IS, no warranty. Used under the Thai WordNet license (http://th.asianwordnet.org/).
 
 WordNet 3.0 Copyright 2006 by Princeton University. All rights reserved. Used under the WordNet license (https://wordnet.princeton.edu/license-and-commercial-use).
+
+Word frequency list (frequency_dictionary_en_82_765, derived from Google Books Ngram + SCOWL) from SymSpell / symspellpy, MIT License. Copyright (c) 2021 Wolf Garbe, (c) 2025 mmb L.

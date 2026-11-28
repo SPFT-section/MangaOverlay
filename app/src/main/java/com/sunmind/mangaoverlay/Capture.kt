@@ -40,10 +40,21 @@ class Capture(proj: MediaProjection, val w: Int, val h: Int, dpi: Int, private v
         vd = proj.createVirtualDisplay("manga", w, h, dpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader.surface, null, handler)
     }
 
+    // ใช้ซ้ำทุกเฟรม: ผู้รับ (Tracker.step) คัดลอกเข้า Mat ทันทีบน thread เดียวกัน จึงไม่ซ้อนกัน
+    private var grayBuf: ByteArray? = null
+
     /** ย่อภาพเป็นเทาโดยเฉลี่ย 2x2 ต่อจุด (เดิมสุ่มจุดเดียว ทำให้เกิด aliasing บนตัวหนังสือ/ลายสกรีน) */
     private fun gray(img: Image): ByteArray {
         val p = img.planes[0]; val b = p.buffer; val rs = p.rowStride; val ps = p.pixelStride
-        val sw = w / Q; val sh = h / Q; val out = ByteArray(sw * sh)
+        val sw = w / Q; val sh = h / Q
+        val buf = grayBuf?.takeIf { it.size == sw * sh } ?: ByteArray(sw * sh).also { grayBuf = it }
+        if (Native.gray(b, b.limit(), rs, ps, w, h, Q, buf)) return buf
+        return grayKt(b, rs, ps, sw, sh)
+    }
+
+    /** ทางสำรอง (Kotlin เดิม) เมื่อโหลดเนทีฟไม่ได้ */
+    private fun grayKt(b: java.nio.ByteBuffer, rs: Int, ps: Int, sw: Int, sh: Int): ByteArray {
+        val out = ByteArray(sw * sh)
         val last = b.limit() - 1
         for (y in 0 until sh) {
             val r0 = y * Q * rs
