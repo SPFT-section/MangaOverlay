@@ -1,6 +1,10 @@
 package com.sunmind.mangaoverlay
 
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
+import android.graphics.Paint
 import android.graphics.Color
 import android.graphics.Rect
 import android.util.LruCache
@@ -55,7 +59,7 @@ object Ocr {
         "such own same other another few little lot lots now let get got go going gonna wanna gotta kinda dunno gotcha lemme gimme ya yo huh heh haha ahh ohh ugh argh " +
         "okay ok yeah yep nope please thanks thank sorry dont doesnt didnt isnt arent wasnt werent wont cant couldnt shouldnt wouldnt").split(' ').toHashSet()
 
-    private class Blk(val r: Rect, val text: String, val lh: Int)
+    private class Blk(val r: Rect, val text: String, val lh: Int, val conf: Float = 1f)
     private class Fit(val r: Rect, val bg: Int)
 
     suspend fun run(bmp: Bitmap, scope: CoroutineScope, minTop: Int = 0): Found {
@@ -69,7 +73,7 @@ object Ocr {
                 val px = IntArray(w * h); bmp.getPixels(px, 0, w, 0, 0, w, h)
                 val img = Img(px, w, h)
                 val cut = intArrayOf(Int.MAX_VALUE, -1)
-                val bl = blocks(img, t, minTop, cut).take(40)
+                val bl = refine(bmp, blocks(img, t, minTop, cut).take(40))
                 val texts = bl.map { normalize(it.text) }
                 // เริ่มแปลทันที ขนานไปกับการหากรอบคำพูด: เครื่องแปลเร็ว (ได้ก่อน) + AI (ถ้าตั้งไว้ ได้ทีหลังแต่ดีกว่า)
                 val d = texts.distinct()
@@ -100,13 +104,70 @@ object Ocr {
             val s = clean(b.text)
             if (junkRe.containsMatchIn(s)) continue // ลายน้ำ/URL
             val hs = b.lines.mapNotNull { it.boundingBox?.height() }.sorted()
-            raw.add(Blk(Rect(bb), s, if (hs.isEmpty()) bb.height() else hs[hs.size / 2]))
+            raw.add(Blk(Rect(bb), s, if (hs.isEmpty()) bb.height() else hs[hs.size / 2], if (b.lines.isEmpty()) 1f else b.lines.map { it.confidence }.average().toFloat()))
         }
         val merged = if (Prefs.merge) merge(img, raw) else raw
         return merged.sortedWith(compareBy({ it.r.top }, { it.r.left })).filter { b ->
             val core = b.text.filter { it.isLetter() }   // "I?" "A!" "I..." ต้องไม่ถูกทิ้ง (เดิมเทียบทั้งข้อความกับ "I"/"A" เป๊ะ ๆ)
             !(core.length < 2 && core != "I" && core != "A") && !noLetterRe.matches(b.text)
         }
+    }
+
+    /** สัดส่วนคำที่เป็นคำอังกฤษจริง (พจนานุกรม/stopword) ใช้ตรวจว่า OCR อ่านเป็นขยะไหม */
+    private fun score(s: String): Float {
+        val ws = wordRe.findAll(s).map { it.value }.toList()
+        if (ws.isEmpty()) return 0f
+        if (!Dict.ready()) return 0.5f
+        return ws.count { w -> w.length <= 2 || w.lowercase() in stop || Dict.lookup(w) != null }.toFloat() / ws.size
+    }
+
+    /** ตัดบล็อกมา ขยาย 3 เท่า + เพิ่มคอนทราสต์ (ปกติ/กลับสี) แล้ว OCR ซ้ำ — ฟอนต์แคบ/ตัวอักษรบนพื้นสี ๆ อ่านได้ดีขึ้นมาก */
+    private fun prep(src: Bitmap, r: Rect, invert: Boolean): Bitmap? {
+        val x0 = max(0, r.left - 8); val y0 = max(0, r.top - 8)
+        val x1 = min(src.width, r.right + 8); val y1 = min(src.height, r.bottom + 8)
+        val cw = x1 - x0; val ch = y1 - y0
+        if (cw < 8 || ch < 8) return null
+        val sc = min(3f, 2400f / max(cw, ch)); if (sc < 1.2f) return null
+        val out = Bitmap.createBitmap((cw * sc).toInt(), (ch * sc).toInt(), Bitmap.Config.ARGB_8888)
+        val c = 1.6f; val t = (1f - c) * 127.5f
+        val k = if (invert) -c else c; val o = if (invert) 255f - t else t
+        val cm = ColorMatrix(floatArrayOf(
+            k * .299f, k * .587f, k * .114f, 0f, o,
+            k * .299f, k * .587f, k * .114f, 0f, o,
+            k * .299f, k * .587f, k * .114f, 0f, o,
+            0f, 0f, 0f, 1f, 0f))
+        val paint = Paint(Paint.FILTER_BITMAP_FLAG).apply { colorFilter = ColorMatrixColorFilter(cm) }
+        Canvas(out).drawBitmap(src, Rect(x0, y0, x1, y1), Rect(0, 0, out.width, out.height), paint)
+        return out
+    }
+
+    private suspend fun refine(bmp: Bitmap, bl: List<Blk>): List<Blk> {
+        var budget = 6
+        val out = ArrayList<Blk>(bl.size)
+        for (b in bl) {
+            val s0 = score(b.text)
+            if (budget <= 0 || (b.conf >= 0.85f && s0 >= 0.6f)) { out.add(b); continue }
+            budget--
+            var best = b; var bs = s0 + b.conf * 0.5f
+            for (inv in booleanArrayOf(false, true)) {
+                val pb = prep(bmp, b.r, inv) ?: continue
+                val t2 = try { rec.process(InputImage.fromBitmap(pb, 0)).await() }
+                         catch (e: CancellationException) { throw e } catch (e: Exception) { null }
+                pb.recycle()
+                if (t2 == null) continue
+                val ls = t2.textBlocks.flatMap { it.lines }
+                if (ls.isEmpty()) continue
+                val s = clean(t2.textBlocks.joinToString(" ") { it.text })
+                if (s.isBlank() || junkRe.containsMatchIn(s)) continue
+                val c = ls.map { it.confidence }.average().toFloat()
+                val sc = score(s) + c * 0.5f
+                if (sc > bs + 0.05f) { bs = sc; best = Blk(b.r, s, b.lh, c) }
+                if (score(best.text) >= 0.7f && best.conf >= 0.8f) break
+            }
+            out.add(best)
+        }
+        // ยังเป็นขยะหลังอ่านซ้ำ (หลายคำ ไม่ใช่คำจริงเป็นส่วนใหญ่ มั่นใจต่ำ) = ไม่แปล ดีกว่าแสดงคำแปลมั่ว
+        return out.filter { b -> !(Dict.ready() && wordRe.findAll(b.text).count() >= 3 && score(b.text) < 0.4f && b.conf < 0.75f) }
     }
 
     private fun toItem(img: Img, b: Blk, text: String): Item {
@@ -140,7 +201,7 @@ object Ocr {
             val m = g.map { a[it] }.sortedBy { it.r.top }
             val r = Rect(m[0].r)
             m.forEach { r.union(it.r) }
-            Blk(r, m.joinToString(" ") { it.text }, m.map { it.lh }.sorted()[m.size / 2])
+            Blk(r, m.joinToString(" ") { it.text }, m.map { it.lh }.sorted()[m.size / 2], m.minOf { it.conf })
         }
     }
 
@@ -231,6 +292,10 @@ object Ocr {
         val r = Rect(bounds.centerX() - hw, bounds.centerY() - hh, bounds.centerX() + hw, bounds.centerY() + hh)
         r.union(Rect(t.left - 4, t.top - 4, t.right + 4, t.bottom + 4))
         if (!r.intersect(bounds)) return null
+        // กล่องต้องสมมาตรรอบข้อความ (เดิมเบี้ยวไปด้านที่ flood-fill ลามได้มากกว่า เช่นฟองไล่สี -> ข้อความแปลไม่ตรงต้นฉบับ)
+        val ex = min(t.left - r.left, r.right - t.right).coerceAtLeast(0)
+        val ey = min(t.top - r.top, r.bottom - t.bottom).coerceAtLeast(0)
+        r.set(t.left - ex, t.top - ey, t.right + ex, t.bottom + ey)
         return Fit(r, Color.rgb(Color.red(bestColor), Color.green(bestColor), Color.blue(bestColor)))
     }
 
