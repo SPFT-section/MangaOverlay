@@ -23,6 +23,10 @@ public:
     /// สัดส่วนคำ (>=3 ตัวอักษร) ที่เป็นคำรู้จัก 0..1; -1 = ข้อมูลน้อยเกินตัดสิน (< 3 คำ)
     float plausibility(const std::string& text, const std::vector<std::string>& protect = {}) const;
 
+    /// คะแนนการสะกดของบรรทัดเดียว 0..1: สัดส่วนคำ (>=2 ตัวอักษร) ที่ "สะกดถูก" = อยู่ในพจนานุกรม/ศัพท์ผู้ใช้ หรือแก้ด้วยกฎ OCR แล้วได้คำในพจนานุกรม
+    /// ตัวอักษรซ้ำล้วน (III, lll, ooo) นับเป็นขยะ; ต้องมีคำถูกอย่างน้อยหนึ่งคำยาว >=3 ตัวอักษร ไม่งั้นได้ 0; -1 = ไม่มีคำให้ตัดสิน
+    float spellScore(const std::string& line, const std::vector<std::string>& protect = {}) const;
+
 private:
     std::unordered_map<std::string, float> lg_;      // คำ -> log10(ความถี่)
     std::unordered_set<std::string> extra_;          // อุทาน/คำญี่ปุ่นที่พบบ่อยในมังงะ
@@ -30,6 +34,10 @@ private:
     bool known(const std::string& w, const std::unordered_set<std::string>& pr) const;
     bool correct(const std::string& tok, bool allCaps, const std::unordered_set<std::string>& pr, std::string& out) const;
     bool best(const std::string& lw, bool allCaps, std::string& out) const;
+    /// เติมตัวอักษรที่ถูกบัง: s (ตัวพิมพ์เล็ก ไม่มีเว้นวรรค) ตรงกับคำเป้าหมายโดยขาดไป <=2 ตัว + แทนด้วยคู่ที่ OCR สับสน <=1 ตัว
+    /// ศัพท์ผู้ใช้/ชื่อที่เคยอ่านชัดแล้ว (pr) มาก่อน; useDict=true ใช้พจนานุกรมด้วย (เฉพาะประเมินคะแนนสะกด ห้ามใช้แก้ข้อความ: ชื่ออย่าง LUFFY จะกลายเป็น FLUFFY); ต้องเป็นคำเดียวที่ดีที่สุดเท่านั้น (เสมอกัน = ไม่แก้)
+    bool gapMatch(const std::string& s, bool title, const std::unordered_set<std::string>& pr, std::string& out, bool useDict) const;
+    std::string fillGaps(const std::string& text, const std::unordered_set<std::string>& pr, bool caps) const;
 };
 
 }  // namespace mo

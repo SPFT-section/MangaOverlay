@@ -97,12 +97,18 @@ object Ocr {
                 continue
             }
             // บรรทัดที่ OCR มั่นใจต่ำมาก (เส้น/ลายพื้นหลังที่อ่านเป็นตัวอักษร) ตัดทิ้งเฉพาะเมื่อบรรทัดอื่นในบล็อกมั่นใจสูง
-            val lines = if (b.lines.any { it.confidence >= 0.5f }) b.lines.filter { it.confidence >= 0.2f } else b.lines
-            if (lines.isNotEmpty() && lines.map { it.confidence }.average() < 0.35) continue
+            // บรรทัดถูกบัง (occlusion) มักมั่นใจต่ำเฉพาะบรรทัดนั้น: กู้กลับเฉพาะเมื่อสะกดตรงพจนานุกรม (Guess.rescuable) ไม่ใช่แค่มีตัวอักษร
+            // ค่าเฉลี่ยความมั่นใจคิดจากบรรทัดที่ผ่านเกณฑ์เดิมเท่านั้น (บรรทัดที่กู้มาไม่ลากค่าเฉลี่ยจนทิ้งทั้งบล็อก)
+            val anyStrong = b.lines.any { it.confidence >= 0.5f }
+            val kept = if (anyStrong) b.lines.filter { it.confidence >= 0.2f } else b.lines
+            val lines = if (anyStrong) b.lines.filter { it.confidence >= 0.2f || Guess.rescuable(it.text) } else b.lines
+            if (kept.isNotEmpty() && kept.map { it.confidence }.average() < 0.35) continue
             val s = Guess.fix(clean(if (lines.size == b.lines.size) b.text else lines.joinToString("\n") { it.text }))
             if (junkRe.containsMatchIn(s)) continue // ลายน้ำ/URL
             // แทบไม่มีคำอังกฤษที่รู้จักเลย + OCR ไม่มั่นใจ = ลายเส้น/สัญลักษณ์ ไม่ใช่บทพูด
-            if ((if (lines.isEmpty()) 1.0 else lines.map { it.confidence }.average()) < 0.6 && Guess.plausibility(s) in 0f..0.15f) continue
+            if ((if (kept.isEmpty()) 1.0 else kept.map { it.confidence }.average()) < 0.6 && Guess.plausibility(s) in 0f..0.15f) continue
+            // บล็อกที่ทุกบรรทัดอ่านชัด (>=0.85) = แหล่งเรียนรู้ชื่อ/ศัพท์ ไว้เติมเมื่อถูกบังภายหลัง
+            if (kept.size == b.lines.size && kept.all { it.confidence >= 0.85f }) Guess.learn(s)
             val hs = lines.mapNotNull { it.boundingBox?.height() }.sorted()
             raw.add(Blk(Rect(bb), s, if (hs.isEmpty()) bb.height() else hs[hs.size / 2]))
         }
