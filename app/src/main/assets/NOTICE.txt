@@ -8,3 +8,8 @@ Optional on-device models (ONNX Runtime, supplied by the user via URL or file; n
 - MI-GAN image inpainting (Picsart AI Research, MIT License).
 - PP-OCRv4/v5 recognition (PaddleOCR, Apache License 2.0).
 - YOLOv8n-bubble: a YOLOv8 detector. Ultralytics YOLOv8 code/weights are AGPL-3.0 unless a separate license is held; check the license of the specific weights you use.
+
+Default model sources (downloaded on demand; check each licence before redistributing):
+- kitsumed/yolov8m_seg-speech-bubble, model_dynamic.onnx (GPL-3.0).
+- PaddlePaddle en_PP-OCRv5_mobile_rec, ONNX copy at bakshinghampalace/en-ppocrv5-mobile-rec-onnx (Apache-2.0).
+- MI-GAN migan_pipeline_v2.onnx (andraniksargsyan/migan export; MIT).

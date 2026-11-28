@@ -17,18 +17,23 @@ import java.security.MessageDigest
 object ModelStore {
     class Spec(val id: String, val fileName: String, val minBytes: Long, val defaultUrl: String, val sha: String?)
 
-    const val REC_URL = "https://huggingface.co/SWHL/RapidOCR/resolve/main/PP-OCRv4/ch_PP-OCRv4_rec_infer.onnx"
-    private const val REC_SHA = "48fc40f24f6d2a207a2b1091d3437eb3cc3eb6b676dc3ef9c37384005483683b"
-
-    val REC = Spec("rec", "rec.onnx", 1_000_000, REC_URL, REC_SHA)
-    val DET = Spec("det", "bubble.onnx", 500_000, "", null)
-    val INP = Spec("inp", "migan.onnx", 1_000_000, "", null)
+    // ลิงก์ค่าเริ่มต้นเป็นของที่ผู้ใช้เลือก (ตรวจชื่อไฟล์จากหน้า repo แล้ว) ; ใส่ URL อื่นทับได้ในหน้าตั้งค่า
+    // DET  : kitsumed/yolov8m_seg-speech-bubble (YOLOv8m-seg, 1 คลาส "speech bubble", GPL-3.0) ไฟล์ dynamic 109 MB
+    // REC  : en_PP-OCRv5_mobile_rec (PaddlePaddle, Apache-2.0) สำเนาของ bakshinghampalace ; ไฟล์ export ของ Paddle ไม่มี metadata ตัวอักษร จึงต้องมี RDICT
+    // RDICT: inference.yml ของโมเดลเดียวกัน (มีรายการ character_dict) ; ไฟล์ .txt ทีละบรรทัดก็ใช้ได้
+    // INP  : MI-GAN pipeline v2 (Picsart, MIT) อินพุต uint8 ขนาดอิสระ ; มาสก์ 0 = ลบ
+    private const val HF = "https://huggingface.co/"
+    val REC = Spec("rec", "rec.onnx", 1_000_000, HF + "bakshinghampalace/en-ppocrv5-mobile-rec-onnx/resolve/main/onnx/model.onnx", null)
+    val RDICT = Spec("recdict", "rec_dict.txt", 100, HF + "bakshinghampalace/en-ppocrv5-mobile-rec-onnx/resolve/main/onnx/inference.yml", null)
+    val DET = Spec("det", "bubble.onnx", 500_000, HF + "kitsumed/yolov8m_seg-speech-bubble/resolve/main/model_dynamic.onnx",
+        "36c26bdefe150226acd9669772e9ff5a011fa0dd4622469b49d3d5e359f3251c")
+    val INP = Spec("inp", "migan.onnx", 1_000_000, HF + "square-zero-labs/migan/resolve/main/migan_pipeline_v2.onnx", null)
 
     fun file(ctx: Context, s: Spec) = File(File(ctx.filesDir, "models").apply { mkdirs() }, s.fileName)
     fun installed(ctx: Context, s: Spec) = file(ctx, s).length() >= s.minBytes
 
     private fun release(s: Spec) {
-        when (s.id) { "rec" -> PpRec.close(); "det" -> BubbleDet.close(); "inp" -> Inpaint.close() }
+        when (s.id) { "rec", "recdict" -> PpRec.close(); "det" -> BubbleDet.close(); "inp" -> Inpaint.close() }
     }
 
     /** คืน null = สำเร็จ ไม่งั้นคืนข้อความผิดพลาด ; เรียกบน thread พื้นหลัง */
@@ -74,7 +79,7 @@ object ModelStore {
     }
 
     fun load(ctx: Context, s: Spec): Boolean = when (s.id) {
-        "rec" -> PpRec.load(ctx); "det" -> BubbleDet.load(ctx); else -> Inpaint.load(ctx)
+        "rec", "recdict" -> PpRec.load(ctx); "det" -> BubbleDet.load(ctx); else -> Inpaint.load(ctx)
     }
-    fun lastErr(s: Spec): String = when (s.id) { "rec" -> PpRec.lastErr; "det" -> BubbleDet.lastErr; else -> Inpaint.lastErr }
+    fun lastErr(s: Spec): String = when (s.id) { "rec", "recdict" -> PpRec.lastErr; "det" -> BubbleDet.lastErr; else -> Inpaint.lastErr }
 }
