@@ -158,7 +158,10 @@ object Ocr {
     }
 
     /** มีเส้นขอบกรอบคำพูดคั่นระหว่างสองบล็อกไหม (สแกนแนวตั้ง 3 เส้น ต้องเจอขอบอย่างน้อย 2 เส้น) */
-    private fun divided(img: Img, x0: Int, x1: Int, y0: Int, y1: Int): Boolean {
+    private fun divided(img: Img, x0: Int, x1: Int, y0: Int, y1: Int): Boolean =
+        Native.divided(img.px, img.w, img.h, x0, x1, y0, y1) ?: dividedKt(img, x0, x1, y0, y1)
+
+    private fun dividedKt(img: Img, x0: Int, x1: Int, y0: Int, y1: Int): Boolean {
         if (y1 - y0 < 3) return false
         var hits = 0
         for (k in 1..3) {
@@ -175,6 +178,15 @@ object Ocr {
 
     // ---------- หากรอบคำพูดรอบข้อความ ----------
     private fun fit(img: Img, t: Rect): Fit? {
+        val o = IntArray(5)
+        return when (Native.fit(img.px, img.w, img.h, t.left, t.top, t.right, t.bottom, o)) {
+            null -> fitKt(img, t)
+            true -> Fit(Rect(o[0], o[1], o[2], o[3]), o[4])
+            false -> null
+        }
+    }
+
+    private fun fitKt(img: Img, t: Rect): Fit? {
         val m = (max(t.width(), t.height()) * 0.8f).toInt().coerceIn(48, 360)
         val cl = max(0, t.left - m); val ct = max(0, t.top - m)
         val cr = min(img.w, t.right + m); val cb = min(img.h, t.bottom + m)
@@ -256,7 +268,10 @@ object Ocr {
     }
 
     /** สีพื้นกรอบคำพูด (สำรอง): มัธยฐานจากจุด 8 จุดรอบนอกข้อความ */
-    private fun bgOf(img: Img, r: Rect): Int {
+    private fun bgOf(img: Img, r: Rect): Int =
+        Native.bgOf(img.px, img.w, img.h, r.left, r.top, r.right, r.bottom) ?: bgOfKt(img, r)
+
+    private fun bgOfKt(img: Img, r: Rect): Int {
         val xs = intArrayOf(r.left - 5, (r.left + r.right) / 2, r.right + 5)
         val ys = intArrayOf(r.top - 5, (r.top + r.bottom) / 2, r.bottom + 5)
         val l = ArrayList<Int>()
