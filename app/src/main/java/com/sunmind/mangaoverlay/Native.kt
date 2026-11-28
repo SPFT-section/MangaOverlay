@@ -15,6 +15,12 @@ object Native {
     @JvmStatic private external fun nFit(px: IntArray, w: Int, h: Int, l: Int, t: Int, r: Int, b: Int, out5: IntArray): Int
     @JvmStatic private external fun nBgOf(px: IntArray, w: Int, h: Int, l: Int, t: Int, r: Int, b: Int): Int
 
+    @JvmStatic private external fun nGuessLoad(data: ByteArray, known: ByteArray?): Int
+    @JvmStatic private external fun nGuessFix(text: String, protect: String): String?
+    @JvmStatic private external fun nGuessPlausible(text: String, protect: String): Float
+
+    @Volatile var guessReady = false; private set
+
     private inline fun <T> guard(f: () -> T?): T? = if (!ok) null else try { f() } catch (e: Throwable) { ok = false; null }
 
     /** true = เขียนผลลงใน out แล้ว */
@@ -32,4 +38,21 @@ object Native {
     /** null = ใช้เนทีฟไม่ได้ */
     fun bgOf(px: IntArray, w: Int, h: Int, l: Int, t: Int, r: Int, b: Int): Int? =
         guard { nBgOf(px, w, h, l, t, r, b) }?.takeIf { it != 0 }
+
+    // ---- แก้คำที่ OCR อ่านผิด: ล้มเหลวเมื่อไรก็ปิดเฉพาะส่วนนี้ (ข้อความเดิมผ่านไปเฉย ๆ) ไม่กระทบฟังก์ชันพิกเซล ----
+    private inline fun <T> guardG(f: () -> T?): T? = if (!ok || !guessReady) null else try { f() } catch (e: Throwable) { guessReady = false; null }
+
+    /** data = "word log10count" ต่อบรรทัด, known = รายการคำเพิ่ม (คำละบรรทัด) หรือ null */
+    fun guessLoad(data: ByteArray, known: ByteArray? = null): Boolean {
+        if (!ok) return false
+        val n = try { nGuessLoad(data, known) } catch (e: Throwable) { 0 }
+        guessReady = n > 0
+        return guessReady
+    }
+
+    /** null = ไม่เปลี่ยน */
+    fun guessFix(text: String, protect: String): String? = guardG { nGuessFix(text, protect) }
+
+    /** 0..1 สัดส่วนคำที่เป็นคำอังกฤษรู้จัก, -1 = ไม่ทราบ/ข้อมูลน้อย */
+    fun guessPlausible(text: String, protect: String): Float = guardG { nGuessPlausible(text, protect) } ?: -1f
 }

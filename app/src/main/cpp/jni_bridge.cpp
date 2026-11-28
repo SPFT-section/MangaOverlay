@@ -1,8 +1,13 @@
 #include <jni.h>
 
 #include <exception>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
 
 #include "calc.hpp"
+#include "wordguess.hpp"
 
 // ทุกฟังก์ชัน: ไม่โยน exception ข้าม JNI, ตรวจ null/ขนาดก่อนใช้, คืนค่าล้มเหลวให้ Kotlin ใช้ทางสำรองเดิม
 namespace {
@@ -20,6 +25,29 @@ struct Critical {
 bool pixelsOk(JNIEnv* env, jintArray a, jint w, jint h) {
     if (!a || w <= 0 || h <= 0) return false;
     return static_cast<jlong>(env->GetArrayLength(a)) >= static_cast<jlong>(w) * h;
+}
+
+std::mutex gGuessMu;
+std::shared_ptr<const mo::WordGuess> gGuess;   // อ่านอย่างเดียวหลังโหลด -> ใช้ข้ามเธรดได้โดยไม่ล็อกระหว่างคำนวณ
+std::shared_ptr<const mo::WordGuess> guessInstance() { std::lock_guard<std::mutex> l(gGuessMu); return gGuess; }
+
+bool utf(JNIEnv* env, jstring s, std::string& out) {
+    if (!s) return false;
+    const char* c = env->GetStringUTFChars(s, nullptr);
+    if (!c) return false;
+    out.assign(c);
+    env->ReleaseStringUTFChars(s, c);
+    return true;
+}
+
+std::vector<std::string> splitLines(const std::string& s) {
+    std::vector<std::string> v; size_t b = 0;
+    while (b <= s.size() && v.size() < 2000) {
+        size_t e = s.find('\n', b); if (e == std::string::npos) e = s.size();
+        if (e > b) v.push_back(s.substr(b, e - b));
+        b = e + 1;
+    }
+    return v;
 }
 
 }  // namespace
@@ -79,6 +107,55 @@ JNIEXPORT jint JNICALL Java_com_sunmind_mangaoverlay_Native_nBgOf(
         if (!a.p) return 0;
         return static_cast<jint>(mo::bgOf(static_cast<const uint32_t*>(a.p), w, h, mo::Rect{l, t, r, b}));
     } catch (...) { return 0; }
+}
+
+// โหลดพจนานุกรมความถี่ ("word log10count" บรรทัดละคำ) คืนจำนวนคำ, 0 = ล้มเหลว
+JNIEXPORT jint JNICALL Java_com_sunmind_mangaoverlay_Native_nGuessLoad(JNIEnv* env, jclass, jbyteArray data, jbyteArray known) {
+    if (!data) return 0;
+    const jsize n = env->GetArrayLength(data);
+    const jsize kn = known ? env->GetArrayLength(known) : 0;
+    if (n <= 0 || n > (16 << 20) || kn < 0 || kn > (32 << 20)) return 0;
+    try {
+        auto g = std::make_shared<mo::WordGuess>();
+        size_t cnt;
+        {
+            // ล็อกทั้งสองอาร์เรย์พร้อมกัน (แบบ critical ซ้อนกันได้) ช่วงสั้น ๆ เท่านั้น
+            Critical<jbyteArray> a(env, data, JNI_ABORT);
+            Critical<jbyteArray> k(env, kn > 0 ? known : nullptr, JNI_ABORT);
+            if (!a.p) return 0;
+            cnt = g->load(static_cast<const char*>(a.p), static_cast<size_t>(n),
+                          k.p ? static_cast<const char*>(k.p) : nullptr, k.p ? static_cast<size_t>(kn) : 0);
+        }
+        if (cnt == 0) return 0;
+        std::lock_guard<std::mutex> l(gGuessMu);
+        gGuess = std::move(g);
+        return static_cast<jint>(cnt);
+    } catch (...) { return 0; }
+}
+
+// คืน null = ไม่ต้องเปลี่ยน/ใช้ไม่ได้ (ผู้เรียกใช้ข้อความเดิม)
+JNIEXPORT jstring JNICALL Java_com_sunmind_mangaoverlay_Native_nGuessFix(JNIEnv* env, jclass, jstring text, jstring protect) {
+    const auto g = guessInstance();
+    if (!g) return nullptr;
+    try {
+        std::string in, pr;
+        if (!utf(env, text, in) || in.empty()) return nullptr;
+        utf(env, protect, pr);
+        const std::string out = g->fix(in, splitLines(pr));
+        if (out == in) return nullptr;
+        return env->NewStringUTF(out.c_str());
+    } catch (...) { return nullptr; }
+}
+
+JNIEXPORT jfloat JNICALL Java_com_sunmind_mangaoverlay_Native_nGuessPlausible(JNIEnv* env, jclass, jstring text, jstring protect) {
+    const auto g = guessInstance();
+    if (!g) return -1.f;
+    try {
+        std::string in, pr;
+        if (!utf(env, text, in)) return -1.f;
+        utf(env, protect, pr);
+        return g->plausibility(in, splitLines(pr));
+    } catch (...) { return -1.f; }
 }
 
 }  // extern "C"

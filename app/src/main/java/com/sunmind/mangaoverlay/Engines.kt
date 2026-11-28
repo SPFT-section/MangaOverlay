@@ -96,10 +96,14 @@ object Ocr {
                 }
                 continue
             }
-            if (b.lines.isNotEmpty() && b.lines.map { it.confidence }.average() < 0.35) continue
-            val s = clean(b.text)
+            // บรรทัดที่ OCR มั่นใจต่ำมาก (เส้น/ลายพื้นหลังที่อ่านเป็นตัวอักษร) ตัดทิ้งเฉพาะเมื่อบรรทัดอื่นในบล็อกมั่นใจสูง
+            val lines = if (b.lines.any { it.confidence >= 0.5f }) b.lines.filter { it.confidence >= 0.2f } else b.lines
+            if (lines.isNotEmpty() && lines.map { it.confidence }.average() < 0.35) continue
+            val s = Guess.fix(clean(if (lines.size == b.lines.size) b.text else lines.joinToString("\n") { it.text }))
             if (junkRe.containsMatchIn(s)) continue // ลายน้ำ/URL
-            val hs = b.lines.mapNotNull { it.boundingBox?.height() }.sorted()
+            // แทบไม่มีคำอังกฤษที่รู้จักเลย + OCR ไม่มั่นใจ = ลายเส้น/สัญลักษณ์ ไม่ใช่บทพูด
+            if ((if (lines.isEmpty()) 1.0 else lines.map { it.confidence }.average()) < 0.6 && Guess.plausibility(s) in 0f..0.15f) continue
+            val hs = lines.mapNotNull { it.boundingBox?.height() }.sorted()
             raw.add(Blk(Rect(bb), s, if (hs.isEmpty()) bb.height() else hs[hs.size / 2]))
         }
         val merged = if (Prefs.merge) merge(img, raw) else raw
@@ -433,6 +437,7 @@ object Translator {
     /** แคชคำแปลถูกเก็บลงดิสก์ด้วย (เปิดแอปใหม่/อ่านหน้าเดิมซ้ำ = ได้คำแปลทันที) ล้างเมื่อศัพท์เฉพาะ/เวอร์ชันสำนวนเปลี่ยน */
     fun init(ctx: Context) {
         app = ctx.applicationContext
+        Guess.init(app)
         val g = Prefs.glossary + "|" + Prefs.mangaStyle
         if (g != glKey) { cache.evictAll(); aiSet.clear(); glKey = g; loadDisk(g) }
     }
